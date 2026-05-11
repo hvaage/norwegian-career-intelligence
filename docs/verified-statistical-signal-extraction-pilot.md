@@ -85,6 +85,32 @@ CSV/JSON output adds **`quality_flags`** (JSON array string), **`min_baseline`**
 
 ---
 
+## 4c. Additional statistical and governance filters (v1.3+)
+
+| CLI | Default | Effect |
+|-----|---------|--------|
+| **`--min-absolute-change`** | `10` | Change-style only: skip when `abs(value_end - value_start)` is below the threshold (`skipped_low_absolute_change`). |
+| **`--exclude-small-slices` / `--include-small-slices`** | exclude **on** | Skip change pairs where **both** `value_start` and `value_end` are **strictly below** `--min-baseline` (`skipped_both_periods_below_baseline`). Distinct from skipping only low `value_start` (`skipped_low_baseline`). |
+| **`--exclude-total-categories` / `--include-total-categories`** | exclude **on** | Skip rows/signals whose codes/labels match **total-like** SSB patterns (aligned with importer hints such as `TOT`, “i alt”, “alle”, “begge kjønn”, “hele landet”, …). Counter: **`skipped_total_categories`**. |
+| **`--strict-validation`** | off | Abort the run (exit non-zero) if a hard validation event occurs during emission (e.g. empty lineage, mixed units, slice mismatch, invalid period granularity pairing). |
+| **`--preview-report-only`** | off | Skip writing **`signal_preview_rows.csv`** and **`review_samples/`**; still emit **`signal_preview_summary.json`** with counters and distributions for CI-style checks. |
+
+**Determinism:** preview rows are **sorted** by `(signal_type, table_id, periods_compared, dimensions_json, source_observation_ids, signal_deterministic_hash)`. Each row includes **`signal_deterministic_hash`** (SHA-256 over slice, periods, observation ids, and `signal_logic_version`) for diff-stable replay.
+
+**Lineage (hardened):** `lineage_json` includes `preview_script_version`, `signal_logic_version`, `generation_timestamp_utc`, dataset ids, optional `dataset_version_id`, `source_observation_signature_count`, and importer proxy fields. Empty lineage is never emitted for change rows (`skipped_lineage_failures`).
+
+**Slice integrity (change-style):** non-time dimensions (excluding `ContentsCode` inside `dimensions_json` for identity checks where applicable), `contents_code` column, and `unit` must match across the two observations; counters: `skipped_slice_mismatch`, `skipped_dimension_mismatch` (contents_code column), `skipped_unit_mismatch`.
+
+**Temporal safeguards:** `period_type` / `period_granularity` are emitted per row. **Year vs quarter** (e.g. `2024` vs `2024K1`) comparisons are rejected (`skipped_invalid_period_pairing`).
+
+**Aggregation safeguards (snapshots):** occupation and workforce snapshots **never** sum across differing `contents_code`, `unit`, or incompatible period granularity within a bucket (`skipped_invalid_aggregation`).
+
+**Manual review samples:** under `data/processed/signal_preview/review_samples/` the script writes capped, deterministically ordered **`top_growth.csv`**, **`top_decline.csv`**, **`unstable_signals.csv`**, **`low_quality_signals.csv`**.
+
+**Operational review:** use `docs/verified-statistical-signal-review-checklist.md` with the expanded **`signal_preview_summary.json`** (`runtime_seconds`, `quality_score_distribution`, per-skip counters, counts by `signal_type` / `direction_label` / `table_id`).
+
+---
+
 ## 5. Confidence logic (pilot)
 
 | Situation | `confidence_score` | Notes |
@@ -112,14 +138,18 @@ Each preview record includes:
 - **`signal_type`**, **`signal_label`**
 - **`table_id`**, **`source_table`** (same as `table_id` for SSB)
 - **`periods_compared`** (e.g. `2023→2024` or single period for snapshots)
+- **`period_type`**, **`period_granularity`** (temporal classification; change rows use `typeA→typeB`)
 - **`value_start`**, **`value_end`**, **`absolute_change`**, **`percent_change`**, **`direction_label`**
 - **`confidence_category`** = `verified_statistical`
 - **`confidence_score`** as per §5
 - **`source_observation_ids`** (UUIDs of contributing observations)
-- **`dimensions_json`**, **`dimension_labels_json`** (slice context; may omit `Tid` in duplicated form for readability in CSV—see script implementation)
-- **`explainability_note`** (short human-readable sentence)
-- **`lineage_json`** (dataset id if available, `source_file`, `normalization_version`, `transformation_version`, script name/version)
-- **`quality_flags`**, **`min_baseline`**, **`contents_code`**, **`contents_code_label`** (see §4b)
+- **`dimensions_json`**, **`dimension_labels_json`** (slice context; JSON keys sorted for stable CSV)
+- **`explainability_note`** (expanded: dimensions included/excluded from identity, thresholds, direction rule, aggregation vs direct comparison)
+- **`explainability_summary_json`** (machine-readable mirror for APIs and future persistence)
+- **`lineage_json`** (hardened provenance: script + logic versions, timestamps, dataset ids, signature counts — see §4c)
+- **`quality_flags`**, **`signal_quality_score`** (0–1 deterministic heuristic), **`quality_reasoning_json`**
+- **`signal_deterministic_hash`** (replay-stable id for diffs)
+- **`min_baseline`**, **`contents_code`**, **`contents_code_label`** (see §4b)
 
 ---
 
@@ -158,7 +188,9 @@ Cross-check preview outputs with:
 - Requires **Supabase** env vars (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`) and migration **`003`** if selecting `observation_signature` (script tolerates missing column by selecting a fixed column set).
 - Use **`--limit`** to cap rows **per table** read from Supabase during the pilot. **Very small limits** (e.g. 100) often return **no two-period slices** for change-style signals, because each `(slice, ContentsCode)` group may not include two distinct periods inside the capped fetch—`skipped_missing_prior_period` will be high and `employment_count_change` may be empty. Raise **`--limit`** (e.g. full table or several thousand) **or** use **`--balanced-periods`** so the cap applies **per period** for change-style generators (see §6).
 - For **`employment_count_change`**, **`regional_education_employment_signal`**, and **`industry_education_employment_signal`**, prefer **`--balanced-periods`** whenever you are not scanning the full table, so the preview window includes both latest periods.
-- Use **`--min-baseline`**, **`--exclude-unspecified`** (default), and optional **`--contents-code`** to tighten preview sets before review (§4b). Summary JSON includes **`skipped_low_baseline`** and **`skipped_unspecified_category`**.
+- Use **`--min-baseline`**, **`--min-absolute-change`**, **`--exclude-unspecified`** (default), **`--exclude-small-slices`** (default), **`--exclude-total-categories`** (default), and optional **`--contents-code`** to tighten preview sets before review (§4b–§4c). Summary JSON lists **all skip counters**, **runtime**, **quality score histogram**, and **counts by signal type / direction / table**.
+- **`--strict-validation`** and **`--preview-report-only`** support CI and governance workflows (§4c).
+- Review capped samples under **`data/processed/signal_preview/review_samples/`** before broad human CSV review.
 - Use **`--table`** to restrict to one SSB table id.
 - Use **`--signal-type`** to run one generator in isolation.
 

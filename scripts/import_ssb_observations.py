@@ -23,10 +23,12 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,7 @@ from supabase import Client, create_client
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT / "data" / "raw" / "ssb"
+REPORTS_DIR = ROOT / "data" / "processed" / "ssb_import_reports"
 
 TABLE_IDS = ["11615", "12850", "08417", "09793"]
 SOURCE_SYSTEM = "ssb_pxwebapi_v2"
@@ -45,6 +48,7 @@ DEFAULT_CONFIDENCE_CATEGORY = "verified_statistical"
 DEFAULT_CONFIDENCE_SCORE = 1.0
 TRANSFORMATION_VERSION = "ssb_jsonstat2_flatten_v1"
 NORMALIZATION_VERSION = "ssb_norm_v1"
+IMPORTER_VERSION = "1.2.0"
 
 TOTAL_LABEL_HINTS = (
     "i alt",
@@ -68,6 +72,47 @@ class Stats:
     warnings: int = 0
     tables_processed: int = 0
     tables_skipped: int = 0
+
+
+@dataclass
+class TableReport:
+    """Per-table validation / import report (JSON-serializable via asdict)."""
+
+    table_id: str
+    source_file: str | None = None
+    metadata_file: str | None = None
+    hard_fails: int = 0
+    warnings: int = 0
+    infos: int = 0
+    hard_fail_messages: list[str] = field(default_factory=list)
+    warning_messages: list[str] = field(default_factory=list)
+    info_messages: list[str] = field(default_factory=list)
+    expected_cells: int = 0
+    value_array_length: int = 0
+    cartesian_match: bool = True
+    flattened_row_count: int = 0
+    skipped_null_count: int = 0
+    inserted_row_count: int = 0
+    duplicate_signature_warnings: int = 0
+    missing_label_count: int = 0
+    missing_dimension_value_id_count: int = 0
+    lineage_complete_count: int = 0
+    lineage_incomplete_count: int = 0
+    existing_observations_count: int = 0
+    status: str = "ok"  # ok | skipped | failed
+
+    def add_hard_fail(self, msg: str) -> None:
+        self.hard_fails += 1
+        self.hard_fail_messages.append(msg)
+        self.status = "failed"
+
+    def add_warning(self, msg: str) -> None:
+        self.warnings += 1
+        self.warning_messages.append(msg)
+
+    def add_info(self, msg: str) -> None:
+        self.infos += 1
+        self.info_messages.append(msg)
 
 
 def _slugify(text: str) -> str:
@@ -136,14 +181,13 @@ def _unwrap_dataset_payload(raw: dict[str, Any], path: Path) -> dict[str, Any]:
 
 
 def _find_ssb_source_id(client: Client) -> str | None:
-    # Best effort: source may not exist yet in some environments.
-    for field, value in (
+    for fld, value in (
         ("slug", "ssb"),
         ("name", "SSB"),
-        ("source_system", SOURCE_SYSTEM),  # field may not exist; ignore errors below
+        ("source_system", SOURCE_SYSTEM),
     ):
         try:
-            res = client.table("sources").select("id").ilike(field, f"%{value}%").limit(1).execute()
+            res = client.table("sources").select("id").ilike(fld, f"%{value}%").limit(1).execute()
             if res.data:
                 return str(res.data[0]["id"])
         except Exception:
@@ -219,7 +263,6 @@ def _upsert_statistical_dataset(
         .execute()
     )
     if not res.data:
-        # fallback fetch if upsert returns empty
         fetched = (
             client.table("statistical_datasets")
             .select("id")
@@ -405,13 +448,62 @@ def _unit_for_cell(dataset: dict[str, Any], code_map: dict[str, str], metric_dim
 
 
 def _period_bounds(period: str | None) -> tuple[str | None, str | None]:
-    # Keep lightweight MVP behavior: if YYYY or YYYYKx we preserve period text only.
-    # period_start/end remain null for now unless strict date can be inferred.
     if not period:
         return None, None
     if re.fullmatch(r"\d{4}", period):
         return f"{period}-01-01", f"{period}-12-31"
     return None, None
+
+
+def _observation_signature(
+    *,
+    table_id: str,
+    source_file: str,
+    period: str | None,
+    contents_code: str | None,
+    code_map: dict[str, str],
+    dim_order: list[str],
+    normalization_version: str,
+) -> str:
+    ordered = [(d, code_map.get(d)) for d in dim_order]
+    payload = {
+        "table_id": table_id,
+        "source_file": source_file,
+        "period": period,
+        "contents_code": contents_code,
+        "dimensions": ordered,
+        "normalization_version": normalization_version,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _expected_cartesian_cells(dim_ids: list[str], positions_per_dim: dict[str, list[str]]) -> int:
+    return math.prod(len(positions_per_dim[d]) for d in dim_ids)
+
+
+def _build_local_dimension_maps(
+    dims: dict[str, Any],
+) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    """Synthetic dimension / value ids for validate-only and dry-run (no Supabase)."""
+    dim_id_by_code: dict[str, str] = {}
+    for dim_code, dim_meta in dims.items():
+        if isinstance(dim_meta, dict):
+            dim_id_by_code[str(dim_code)] = f"local-dim-{_slugify(str(dim_code))}"
+
+    dim_value_map: dict[tuple[str, str], str] = {}
+    for dim_code, dim_meta in dims.items():
+        if not isinstance(dim_meta, dict):
+            continue
+        idx_map = ((dim_meta.get("category") or {}).get("index") or {})
+        if not isinstance(idx_map, dict):
+            continue
+        ordered = sorted(idx_map.items(), key=lambda kv: kv[1])
+        for value_code, _so in ordered:
+            value_code = str(value_code)
+            dslug = _slugify(str(dim_code))
+            dim_value_map[(str(dim_code), value_code)] = f"local-dv-{dslug}-{_slugify(value_code)}"
+    return dim_id_by_code, dim_value_map
 
 
 def _flatten_observations(
@@ -424,7 +516,7 @@ def _flatten_observations(
     *,
     ingestion_batch_id: str,
     limit: int | None,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     ids = dataset.get("id")
     values = dataset.get("value")
     dims = dataset.get("dimension")
@@ -441,6 +533,19 @@ def _flatten_observations(
         if not pos:
             raise RuntimeError(f"[{table_id}] Empty category index for {d}")
         positions_per_dim[d] = pos
+
+    expected_cells = _expected_cartesian_cells(dim_ids, positions_per_dim)
+    value_len = len(values)
+    extras: dict[str, Any] = {
+        "expected_cells": expected_cells,
+        "value_array_length": value_len,
+        "cartesian_match": expected_cells == value_len,
+    }
+    if expected_cells != value_len:
+        raise RuntimeError(
+            f"[{table_id}] Cartesian size mismatch: product(dimensions)={expected_cells} "
+            f"but len(value)={value_len}"
+        )
 
     time_dim = _time_dimension_id(dataset)
     metric_dim = _metric_dimension_id(dataset)
@@ -473,10 +578,21 @@ def _flatten_observations(
         unit = _unit_for_cell(dataset, code_map, metric_dim)
         contents_code = code_map.get(metric_dim) if metric_dim else None
 
-        raw_obs = {
+        signature = _observation_signature(
+            table_id=table_id,
+            source_file=source_file.name,
+            period=period,
+            contents_code=contents_code,
+            code_map=code_map,
+            dim_order=dim_ids,
+            normalization_version=NORMALIZATION_VERSION,
+        )
+
+        raw_obs: dict[str, Any] = {
             "value": val,
             "dimension_codes": code_map,
             "dimension_labels": label_map,
+            "observation_signature": signature,
         }
         row = {
             "statistical_dataset_id": statistical_dataset_id,
@@ -495,6 +611,7 @@ def _flatten_observations(
             "dimension_value_ids": dim_value_ids,
             "metadata_json": {
                 "dimension_ids": dim_ids,
+                "observation_signature": signature,
             },
             "raw_observation_json": raw_obs,
             "confidence_category": DEFAULT_CONFIDENCE_CATEGORY,
@@ -508,25 +625,113 @@ def _flatten_observations(
             "normalization_version": NORMALIZATION_VERSION,
         }
         rows.append(row)
-    return rows, skipped_null
+    return rows, skipped_null, extras
 
 
-def _existing_observations_count(
-    client: Client,
-    table_id: str,
-    source_file: str,
-) -> int:
-    res = (
-        client.table("statistical_observations")
-        .select("id", count="exact")
-        .eq("table_id", table_id)
-        .eq("source_file", source_file)
-        .limit(1)
-        .execute()
-    )
-    if hasattr(res, "count") and res.count is not None:
-        return int(res.count)
-    return len(res.data or [])
+def _row_lineage_complete(row: dict[str, Any], dim_ids: list[str]) -> bool:
+    if not row.get("table_id") or not row.get("source_file"):
+        return False
+    if not row.get("ingestion_batch_id"):
+        return False
+    if not row.get("normalization_version") or not row.get("transformation_version"):
+        return False
+    dj = row.get("dimensions_json")
+    if not isinstance(dj, dict) or not dj:
+        return False
+    raw = row.get("raw_observation_json")
+    if not isinstance(raw, dict) or not raw.get("observation_signature"):
+        return False
+    dvi = row.get("dimension_value_ids")
+    if not isinstance(dvi, list) or len(dvi) < len(dim_ids):
+        return False
+    return True
+
+
+def _analyze_observation_rows(rows: list[dict[str, Any]], dim_ids: list[str]) -> dict[str, Any]:
+    missing_labels = 0
+    missing_dv_ids = 0
+    lineage_ok = 0
+    lineage_bad = 0
+    for row in rows:
+        labels = row.get("dimension_labels_json") or {}
+        codes = row.get("dimensions_json") or {}
+        for d in dim_ids:
+            if d not in codes:
+                continue
+            lab = labels.get(d) if isinstance(labels, dict) else None
+            if lab is None or (isinstance(lab, str) and not lab.strip()):
+                missing_labels += 1
+        dvi = row.get("dimension_value_ids")
+        if not isinstance(dvi, list) or len(dvi) < len(dim_ids):
+            missing_dv_ids += 1
+        if _row_lineage_complete(row, dim_ids):
+            lineage_ok += 1
+        else:
+            lineage_bad += 1
+
+    sigs = []
+    for row in rows:
+        raw = row.get("raw_observation_json") or {}
+        s = raw.get("observation_signature")
+        if isinstance(s, str):
+            sigs.append(s)
+    dup_surplus = 0
+    if sigs:
+        cnt = Counter(sigs)
+        dup_surplus = sum(c - 1 for c in cnt.values() if c > 1)
+
+    return {
+        "missing_label_cells": missing_labels,
+        "missing_dimension_value_id_rows": missing_dv_ids,
+        "lineage_complete_count": lineage_ok,
+        "lineage_incomplete_count": lineage_bad,
+        "duplicate_signature_warnings": dup_surplus,
+    }
+
+
+def _apply_analysis_to_report(rep: TableReport, analysis: dict[str, Any], dim_ids: list[str]) -> None:
+    rep.missing_label_count = int(analysis["missing_label_cells"])
+    rep.missing_dimension_value_id_count = int(analysis["missing_dimension_value_id_rows"])
+    rep.lineage_complete_count = int(analysis["lineage_complete_count"])
+    rep.lineage_incomplete_count = int(analysis["lineage_incomplete_count"])
+    rep.duplicate_signature_warnings = int(analysis["duplicate_signature_warnings"])
+
+    if rep.missing_label_count > 0:
+        rep.add_warning(
+            f"missing label cells: {rep.missing_label_count} (dimension × row cells with empty label)"
+        )
+    if rep.missing_dimension_value_id_count > 0:
+        rep.add_warning(
+            f"rows with incomplete dimension_value_ids: {rep.missing_dimension_value_id_count} "
+            f"(expected {len(dim_ids)} ids per row)"
+        )
+    if rep.duplicate_signature_warnings > 0:
+        rep.add_warning(
+            f"duplicate observation_signature surplus rows: {rep.duplicate_signature_warnings} "
+            "(within this batch; possible duplicate facts or flatten bug)"
+        )
+    if rep.lineage_incomplete_count > 0:
+        rep.add_warning(f"rows failing lineage completeness check: {rep.lineage_incomplete_count}")
+
+
+def _existing_observations_count(client: Client, table_id: str, source_file: str) -> int:
+    try:
+        res = (
+            client.table("statistical_observations")
+            .select("id", count="exact")
+            .eq("table_id", table_id)
+            .eq("source_file", source_file)
+            .limit(1)
+            .execute()
+        )
+        if hasattr(res, "count") and res.count is not None:
+            return int(res.count)
+        return len(res.data or [])
+    except Exception as exc:
+        raise RuntimeError(
+            f"Supabase query failed while counting existing observations for "
+            f"table_id={table_id} source_file={source_file}: {exc}"
+        ) from exc
 
 
 def _insert_observations_batched(
@@ -539,26 +744,178 @@ def _insert_observations_batched(
     total = len(rows)
     if total == 0:
         return 0
+    n_batches = (total + batch_size - 1) // batch_size
     for start in range(0, total, batch_size):
         batch = rows[start : start + batch_size]
         end = min(start + batch_size, total)
-        print(f"[{table_id}] inserting batch {start // batch_size + 1}: rows {start + 1}-{end}/{total}")
+        bi = start // batch_size + 1
+        print(f"  [{table_id}] insert batch {bi}/{n_batches}: rows {start + 1}-{end}/{total}")
         try:
             client.table("statistical_observations").insert(batch).execute()
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"[{table_id}] Supabase insert error in batch {start // batch_size + 1}: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"[{table_id}] Supabase insert error in batch {bi}/{n_batches}: {exc}"
+            ) from exc
         inserted += len(batch)
     return inserted
 
 
-def _process_table(
+def _print_table_validation_block(table_id: str, rep: TableReport) -> None:
+    print(f"\n  --- Validation summary: {table_id} ---")
+    print(f"  source_file: {rep.source_file}")
+    print(f"  expected_cells (cartesian): {rep.expected_cells}")
+    print(f"  value_array_length:         {rep.value_array_length}")
+    print(f"  cartesian_match:            {rep.cartesian_match}")
+    print(f"  flattened_row_count:        {rep.flattened_row_count}")
+    print(f"  skipped_null_count:         {rep.skipped_null_count}")
+    print(f"  inserted_row_count:         {rep.inserted_row_count}")
+    print(f"  duplicate_signature_warn:   {rep.duplicate_signature_warnings}")
+    print(f"  missing_label_cells:        {rep.missing_label_count}")
+    print(f"  missing_dim_value_id_rows:  {rep.missing_dimension_value_id_count}")
+    print(f"  lineage_complete_rows:      {rep.lineage_complete_count}")
+    print(f"  lineage_incomplete_rows:    {rep.lineage_incomplete_count}")
+    print(f"  existing_observations (DB): {rep.existing_observations_count}")
+    print(f"  hard_fails / warnings / infos: {rep.hard_fails} / {rep.warnings} / {rep.infos}")
+    if rep.hard_fail_messages:
+        print("  HARD FAIL messages:")
+        for m in rep.hard_fail_messages:
+            print(f"    - {m}")
+    if rep.warning_messages:
+        print("  WARNING messages:")
+        for m in rep.warning_messages:
+            print(f"    - {m}")
+    if rep.info_messages:
+        print("  INFO messages:")
+        for m in rep.info_messages:
+            print(f"    - {m}")
+
+
+def _write_import_report(
+    *,
+    mode: str,
+    ingestion_batch_id: str,
+    table_reports: list[TableReport],
+    totals: dict[str, Any],
+) -> Path:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_batch = re.sub(r"[^a-zA-Z0-9._-]+", "_", ingestion_batch_id)[:40]
+    path = REPORTS_DIR / f"ssb_import_{safe_batch}_{ts}.json"
+    payload = {
+        "importer_version": IMPORTER_VERSION,
+        "normalization_version": NORMALIZATION_VERSION,
+        "transformation_version": TRANSFORMATION_VERSION,
+        "ingestion_batch_id": ingestion_batch_id,
+        "timestamp_utc": _now_utc(),
+        "mode": mode,
+        "tables": [asdict(tr) for tr in table_reports],
+        "totals": totals,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _load_and_flatten_table(
+    table_id: str,
+    args: argparse.Namespace,
+    *,
+    statistical_dataset_id: str,
+    source_id: str | None,
+    dimension_value_map: dict[tuple[str, str], str],
+    ingestion_batch_id: str,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any], list[str], TableReport]:
+    rep = TableReport(table_id=table_id)
+    raw_file = _main_raw_file_for_table(table_id)
+    rep.source_file = raw_file.name
+    raw = _safe_json_file(raw_file)
+    dataset = _unwrap_dataset_payload(raw, raw_file)
+
+    metadata_path = _metadata_file_for_table(table_id)
+    if metadata_path is None:
+        rep.add_warning("no sidecar metadata file (*_metadata.json); continuing with dataset metadata only")
+    else:
+        rep.metadata_file = metadata_path.name
+        rep.add_info(f"metadata file present: {metadata_path.name}")
+
+    dims = dataset.get("dimension")
+    if not isinstance(dims, dict):
+        rep.add_hard_fail("missing or invalid 'dimension' object on dataset")
+        return [], 0, {}, [], rep
+
+    dim_ids = [str(x) for x in (dataset.get("id") or [])]
+    if not dim_ids:
+        rep.add_hard_fail("dataset 'id' dimension order list is empty")
+        return [], 0, {}, [], rep
+
+    try:
+        rows, skipped_null, extras = _flatten_observations(
+            table_id=table_id,
+            source_file=raw_file,
+            dataset=dataset,
+            statistical_dataset_id=statistical_dataset_id,
+            source_id=source_id,
+            dimension_value_map=dimension_value_map,
+            ingestion_batch_id=ingestion_batch_id,
+            limit=args.limit,
+        )
+    except RuntimeError as exc:
+        rep.add_hard_fail(str(exc))
+        return [], 0, {}, dim_ids, rep
+
+    rep.expected_cells = int(extras["expected_cells"])
+    rep.value_array_length = int(extras["value_array_length"])
+    rep.cartesian_match = bool(extras["cartesian_match"])
+    rep.flattened_row_count = len(rows)
+    rep.skipped_null_count = skipped_null
+
+    analysis = _analyze_observation_rows(rows, dim_ids)
+    _apply_analysis_to_report(rep, analysis, dim_ids)
+    return rows, skipped_null, extras, dim_ids, rep
+
+
+def _process_table_local(
+    table_id: str,
+    args: argparse.Namespace,
+    ingestion_batch_id: str,
+    *,
+    label: str,
+) -> TableReport:
+    print(f"\n[{label}] table={table_id}")
+    raw_path = _main_raw_file_for_table(table_id)
+    raw = _safe_json_file(raw_path)
+    dataset = _unwrap_dataset_payload(raw, raw_path)
+    d = dataset.get("dimension")
+    if not isinstance(d, dict):
+        rep = TableReport(table_id=table_id, source_file=raw_path.name)
+        rep.add_hard_fail("missing dimension object")
+        _print_table_validation_block(table_id, rep)
+        return rep
+    _, dim_value_map = _build_local_dimension_maps(d)
+    rows, _sk, _ex, dim_ids, rep = _load_and_flatten_table(
+        table_id,
+        args,
+        statistical_dataset_id=f"local-{table_id}",
+        source_id=None,
+        dimension_value_map=dim_value_map,
+        ingestion_batch_id=ingestion_batch_id,
+    )
+    rep.inserted_row_count = 0
+    rep.existing_observations_count = 0
+    if rep.hard_fails == 0:
+        rep.add_info(f"{label}: no database writes; {len(rows)} rows validated in memory")
+    _print_table_validation_block(table_id, rep)
+    return rep
+
+
+def _process_table_import(
     client: Client,
     table_id: str,
     args: argparse.Namespace,
     source_id: str | None,
     stats: Stats,
     ingestion_batch_id: str,
-) -> None:
+) -> TableReport:
+    print(f"\n[import] table={table_id}")
     raw_file = _main_raw_file_for_table(table_id)
     raw = _safe_json_file(raw_file)
     dataset = _unwrap_dataset_payload(raw, raw_file)
@@ -566,28 +923,33 @@ def _process_table(
     metadata_path = _metadata_file_for_table(table_id)
     metadata = _safe_json_file(metadata_path) if metadata_path else None
     if metadata_path is None:
-        print(f"[{table_id}] warning: no metadata file found (continuing)")
+        print(f"  [{table_id}] WARNING: no metadata file found (continuing)")
         stats.warnings += 1
 
-    print(f"\n[{table_id}] source file: {raw_file.name}")
+    print(f"  [{table_id}] source file: {raw_file.name}")
     if metadata_path:
-        print(f"[{table_id}] metadata file: {metadata_path.name}")
+        print(f"  [{table_id}] metadata file: {metadata_path.name}")
 
     statistical_dataset_id = _upsert_statistical_dataset(
-        client, table_id, source_id, metadata or dataset, raw_file, args.dry_run
+        client, table_id, source_id, metadata or dataset, raw_file, dry_run=False
     )
     stats.datasets_upserted += 1
 
     dims = dataset.get("dimension")
     if not isinstance(dims, dict):
-        raise RuntimeError(f"[{table_id}] Unexpected metadata shape: missing 'dimension' object")
+        rep = TableReport(table_id=table_id, source_file=raw_file.name)
+        rep.add_hard_fail("missing or invalid 'dimension' object on dataset")
+        _print_table_validation_block(table_id, rep)
+        return rep
 
-    # Upsert dimensions and values, build lookup map.
     dim_id_by_code: dict[str, str] = {}
     for dim_code, dim_meta in dims.items():
         if not isinstance(dim_meta, dict):
-            raise RuntimeError(f"[{table_id}] Unexpected dimension shape for '{dim_code}'")
-        dim_id = _upsert_dimension(client, str(dim_code), dim_meta, args.dry_run)
+            rep = TableReport(table_id=table_id, source_file=raw_file.name)
+            rep.add_hard_fail(f"unexpected dimension shape for '{dim_code}'")
+            _print_table_validation_block(table_id, rep)
+            return rep
+        dim_id = _upsert_dimension(client, str(dim_code), dim_meta, dry_run=False)
         dim_id_by_code[str(dim_code)] = dim_id
         stats.dimensions_upserted += 1
 
@@ -602,59 +964,83 @@ def _process_table(
         for value_code, sort_order in ordered:
             value_code = str(value_code)
             label_no = _value_label(dim_meta, value_code)
+            so = int(sort_order) if sort_order is not None else 0
             dv_id = _upsert_dimension_value(
                 client=client,
                 dimension_id=dim_id_by_code[str(dim_code)],
                 value_code=value_code,
                 label_no=label_no,
-                sort_order=int(sort_order) if sort_order is not None else None,
-                dry_run=args.dry_run,
+                sort_order=so,
+                dry_run=False,
             )
             dim_value_map[(str(dim_code), value_code)] = dv_id
             stats.dimension_values_upserted += 1
 
-    rows, skipped_null = _flatten_observations(
-        table_id=table_id,
-        source_file=raw_file,
-        dataset=dataset,
+    rows, skipped_null, _extras, dim_ids, rep = _load_and_flatten_table(
+        table_id,
+        args,
         statistical_dataset_id=statistical_dataset_id,
         source_id=source_id,
         dimension_value_map=dim_value_map,
         ingestion_batch_id=ingestion_batch_id,
-        limit=args.limit,
     )
     stats.skipped_null_values += skipped_null
 
-    print(f"[{table_id}] flattened observations: {len(rows)}")
-    print(f"[{table_id}] skipped null values: {skipped_null}")
-
-    if args.dry_run:
-        print(f"[{table_id}] dry-run: no inserts executed.")
-        stats.tables_processed += 1
-        return
-
-    existing = _existing_observations_count(client, table_id, raw_file.name)
-    if existing > 0 and not args.allow_existing:
-        print(
-            f"[{table_id}] WARNING: found {existing} existing observations for table_id={table_id} and source_file={raw_file.name}. "
-            "Use --allow-existing to continue."
-        )
-        stats.warnings += 1
+    if rep.hard_fails:
         stats.tables_skipped += 1
-        return
-    if existing > 0:
-        print(f"[{table_id}] existing observations found ({existing}); continuing due to --allow-existing.")
+        _print_table_validation_block(table_id, rep)
+        return rep
+
+    try:
+        existing = _existing_observations_count(client, table_id, raw_file.name)
+    except RuntimeError as exc:
+        rep.add_hard_fail(str(exc))
+        stats.tables_skipped += 1
+        _print_table_validation_block(table_id, rep)
+        return rep
+
+    rep.existing_observations_count = existing
+    print(f"  [{table_id}] existing observations in DB (table_id + source_file): {existing}")
+
+    if existing > 0 and not args.allow_existing:
+        msg = (
+            f"refusing import: {existing} existing observation row(s) for table_id={table_id} "
+            f"and source_file={raw_file.name}. Pass --allow-existing to insert anyway, "
+            "or remove/rename conflicting data."
+        )
+        rep.add_hard_fail(msg)
+        stats.tables_skipped += 1
+        print(f"  [{table_id}] HARD STOP: {msg}", file=sys.stderr)
+        _print_table_validation_block(table_id, rep)
+        return rep
+
+    if existing > 0 and args.allow_existing:
+        rep.add_warning(
+            f"--allow-existing: {existing} row(s) already present; inserting {len(rows)} additional row(s) (possible duplicates)"
+        )
         stats.warnings += 1
 
     inserted = _insert_observations_batched(client, table_id, rows, args.batch_size)
+    rep.inserted_row_count = inserted
     stats.observations_inserted += inserted
     stats.tables_processed += 1
-    print(f"[{table_id}] inserted observations: {inserted}")
+    print(f"  [{table_id}] inserted observations: {inserted}")
+    _print_table_validation_block(table_id, rep)
+    return rep
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import SSB observations into statistical observation tables.")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and count without inserting/upserting.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Local parse + flatten + validation only; no Supabase (same workload as --validate-only; mode tag differs).",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Parse local JSON only; validate structure and rows; no Supabase.",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -684,65 +1070,130 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     if args.batch_size <= 0:
-        raise RuntimeError("--batch-size must be > 0")
+        print("ERROR: --batch-size must be > 0", file=sys.stderr)
+        return 1
     if args.limit is not None and args.limit <= 0:
-        raise RuntimeError("--limit must be > 0")
+        print("ERROR: --limit must be > 0", file=sys.stderr)
+        return 1
+    if args.validate_only and args.dry_run:
+        print("ERROR: use only one of --validate-only or --dry-run", file=sys.stderr)
+        return 1
 
     selected_tables = [args.table] if args.table else TABLE_IDS
     for t in selected_tables:
         if t not in TABLE_IDS:
-            raise RuntimeError(f"Unsupported table '{t}'. Allowed: {TABLE_IDS}")
+            print(f"ERROR: unsupported table '{t}'. Allowed: {TABLE_IDS}", file=sys.stderr)
+            return 1
 
+    validate_only = args.validate_only
+    importer_dry_run = args.dry_run
+    mode = "validate_only" if validate_only else ("dry_run" if importer_dry_run else "import")
+
+    print("=" * 60)
     print("SSB observation import MVP")
-    print(f"tables: {selected_tables}")
-    print(f"dry_run: {args.dry_run}")
-    print(f"limit: {args.limit}")
-    print(f"batch_size: {args.batch_size}")
-    print(f"allow_existing: {args.allow_existing}")
+    print(f"  importer_version:       {IMPORTER_VERSION}")
+    print(f"  normalization_version:  {NORMALIZATION_VERSION}")
+    print(f"  transformation_version:{TRANSFORMATION_VERSION}")
+    print(f"  mode:                   {mode}")
+    print(f"  tables:                 {selected_tables}")
+    print(f"  limit:                  {args.limit}")
+    print(f"  batch_size:             {args.batch_size}")
+    print(f"  allow_existing:         {args.allow_existing}")
+    print("=" * 60)
 
-    client = _load_env_client()
-    source_id = _find_ssb_source_id(client)
-    if source_id:
-        print(f"resolved SSB source_id: {source_id}")
-    else:
-        print("warning: could not resolve SSB source_id from sources; using NULL source_id")
-
-    stats = Stats()
-    ingest_seed = f"{_now_utc()}|{selected_tables}|{args.limit}|{args.dry_run}"
+    ingest_seed = f"{_now_utc()}|{selected_tables}|{args.limit}|{mode}|{IMPORTER_VERSION}"
     ingestion_batch_id = f"ssb-import-{hashlib.sha1(ingest_seed.encode('utf-8')).hexdigest()[:12]}"
     print(f"ingestion_batch_id: {ingestion_batch_id}")
 
-    try:
-        for table_id in selected_tables:
-            _process_table(client, table_id, args, source_id, stats, ingestion_batch_id)
-    except Exception as exc:  # noqa: BLE001
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        print(
-            "\nPartial summary before failure:\n"
-            f"  datasets upserted: {stats.datasets_upserted}\n"
-            f"  dimensions upserted: {stats.dimensions_upserted}\n"
-            f"  dimension values upserted: {stats.dimension_values_upserted}\n"
-            f"  observations inserted: {stats.observations_inserted}\n"
-            f"  skipped null values: {stats.skipped_null_values}\n"
-            f"  warnings: {stats.warnings}\n"
-            f"  tables processed: {stats.tables_processed}\n"
-            f"  tables skipped: {stats.tables_skipped}",
-            file=sys.stderr,
-        )
-        return 1
+    table_reports: list[TableReport] = []
+    stats = Stats()
+    exit_code = 0
 
-    print("\n--- Summary ---")
-    print(f"datasets upserted: {stats.datasets_upserted}")
-    print(f"dimensions upserted: {stats.dimensions_upserted}")
-    print(f"dimension values upserted: {stats.dimension_values_upserted}")
-    print(f"observations inserted: {stats.observations_inserted}")
-    print(f"skipped null values: {stats.skipped_null_values}")
-    print(f"warnings: {stats.warnings}")
-    print(f"tables processed: {stats.tables_processed}")
-    print(f"tables skipped: {stats.tables_skipped}")
-    return 0
+    try:
+        if validate_only or importer_dry_run:
+            tag = "validate-only" if validate_only else "dry-run"
+            print(f"\n--{tag}: no Supabase (local parse + flatten + validation; no writes)")
+            for table_id in selected_tables:
+                tr = _process_table_local(table_id, args, ingestion_batch_id, label=tag)
+                table_reports.append(tr)
+                if tr.hard_fails:
+                    exit_code = 1
+        else:
+            client = _load_env_client()
+            source_id = _find_ssb_source_id(client)
+            if source_id:
+                print(f"resolved SSB source_id: {source_id}")
+            else:
+                print("warning: could not resolve SSB source_id from sources; using NULL source_id")
+                stats.warnings += 1
+            for table_id in selected_tables:
+                tr = _process_table_import(
+                    client,
+                    table_id,
+                    args,
+                    source_id,
+                    stats,
+                    ingestion_batch_id,
+                )
+                table_reports.append(tr)
+                if tr.hard_fails:
+                    exit_code = 1
+
+    except RuntimeError as exc:
+        print(f"\nFATAL: {exc}", file=sys.stderr)
+        exit_code = 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"\nFATAL (unexpected): {exc}", file=sys.stderr)
+        exit_code = 1
+
+    total_hf = sum(tr.hard_fails for tr in table_reports)
+    total_wn = sum(tr.warnings for tr in table_reports)
+    total_inf = sum(tr.infos for tr in table_reports)
+    totals = {
+        "datasets_upserted": stats.datasets_upserted,
+        "dimensions_upserted": stats.dimensions_upserted,
+        "dimension_values_upserted": stats.dimension_values_upserted,
+        "observations_inserted": stats.observations_inserted,
+        "skipped_null_values": stats.skipped_null_values,
+        "tables_processed": stats.tables_processed,
+        "tables_skipped": stats.tables_skipped,
+        "total_hard_fails": total_hf,
+        "total_warnings": total_wn,
+        "total_infos": total_inf,
+        "flattened_rows_sum": sum(tr.flattened_row_count for tr in table_reports),
+        "exit_code": exit_code,
+    }
+
+    print("\n" + "=" * 60)
+    print("FINAL SUMMARY")
+    print(f"  total hard_fail (messages): {total_hf}")
+    print(f"  total warnings:             {total_wn}")
+    print(f"  total infos:                {total_inf}")
+    print(f"  flattened rows (sum tables):{totals['flattened_rows_sum']}")
+    if not validate_only and not importer_dry_run:
+        print(f"  datasets upserted:          {stats.datasets_upserted}")
+        print(f"  dimensions upserted:        {stats.dimensions_upserted}")
+        print(f"  dimension values upserted:  {stats.dimension_values_upserted}")
+        print(f"  observations inserted:      {stats.observations_inserted}")
+        print(f"  skipped null values:        {stats.skipped_null_values}")
+        print(f"  tables processed:           {stats.tables_processed}")
+        print(f"  tables skipped:             {stats.tables_skipped}")
+    print("=" * 60)
+
+    try:
+        report_path = _write_import_report(
+            mode=mode,
+            ingestion_batch_id=ingestion_batch_id,
+            table_reports=table_reports,
+            totals=totals,
+        )
+        print(f"\nWrote import report: {report_path}")
+    except OSError as exc:
+        print(f"\nWARNING: could not write import report: {exc}", file=sys.stderr)
+        stats.warnings += 1
+
+    return exit_code
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

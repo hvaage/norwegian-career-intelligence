@@ -48,7 +48,13 @@ DEFAULT_CONFIDENCE_CATEGORY = "verified_statistical"
 DEFAULT_CONFIDENCE_SCORE = 1.0
 TRANSFORMATION_VERSION = "ssb_jsonstat2_flatten_v1"
 NORMALIZATION_VERSION = "ssb_norm_v1"
-IMPORTER_VERSION = "1.2.0"
+IMPORTER_VERSION = "1.3.1"
+
+# PostgREST GET filters embed `.in_(...)` in the URL; long lists of 64-char SHA-256 hex
+# signatures exceed practical gateway limits. Each HTTP request uses at most this many
+# signatures regardless of --signature-lookup-chunk-size (see _signature_lookup_transport_size).
+SIGNATURE_LOOKUP_TRANSPORT_CAP = 75
+DEFAULT_SIGNATURE_LOOKUP_CHUNK_SIZE = 500
 
 TOTAL_LABEL_HINTS = (
     "i alt",
@@ -69,6 +75,7 @@ class Stats:
     dimension_values_upserted: int = 0
     observations_inserted: int = 0
     skipped_null_values: int = 0
+    skipped_existing_signatures: int = 0
     warnings: int = 0
     tables_processed: int = 0
     tables_skipped: int = 0
@@ -93,7 +100,8 @@ class TableReport:
     flattened_row_count: int = 0
     skipped_null_count: int = 0
     inserted_row_count: int = 0
-    duplicate_signature_warnings: int = 0
+    duplicate_signatures_in_batch: int = 0
+    skipped_existing_signatures: int = 0
     missing_label_count: int = 0
     missing_dimension_value_id_count: int = 0
     lineage_complete_count: int = 0
@@ -598,6 +606,7 @@ def _flatten_observations(
             "statistical_dataset_id": statistical_dataset_id,
             "dataset_version_id": None,
             "source_id": source_id,
+            "observation_signature": signature,
             "table_id": table_id,
             "source_file": source_file.name,
             "period": period,
@@ -638,13 +647,27 @@ def _row_lineage_complete(row: dict[str, Any], dim_ids: list[str]) -> bool:
     dj = row.get("dimensions_json")
     if not isinstance(dj, dict) or not dj:
         return False
-    raw = row.get("raw_observation_json")
-    if not isinstance(raw, dict) or not raw.get("observation_signature"):
-        return False
+    sig = row.get("observation_signature")
+    if not (isinstance(sig, str) and sig.strip()):
+        raw = row.get("raw_observation_json")
+        if not isinstance(raw, dict) or not raw.get("observation_signature"):
+            return False
     dvi = row.get("dimension_value_ids")
     if not isinstance(dvi, list) or len(dvi) < len(dim_ids):
         return False
     return True
+
+
+def _row_observation_signature(row: dict[str, Any]) -> str:
+    s = row.get("observation_signature")
+    if isinstance(s, str) and s.strip():
+        return s.strip()
+    raw = row.get("raw_observation_json") or {}
+    if isinstance(raw, dict):
+        inner = raw.get("observation_signature")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return ""
 
 
 def _analyze_observation_rows(rows: list[dict[str, Any]], dim_ids: list[str]) -> dict[str, Any]:
@@ -669,11 +692,10 @@ def _analyze_observation_rows(rows: list[dict[str, Any]], dim_ids: list[str]) ->
         else:
             lineage_bad += 1
 
-    sigs = []
+    sigs: list[str] = []
     for row in rows:
-        raw = row.get("raw_observation_json") or {}
-        s = raw.get("observation_signature")
-        if isinstance(s, str):
+        s = _row_observation_signature(row)
+        if s:
             sigs.append(s)
     dup_surplus = 0
     if sigs:
@@ -685,7 +707,7 @@ def _analyze_observation_rows(rows: list[dict[str, Any]], dim_ids: list[str]) ->
         "missing_dimension_value_id_rows": missing_dv_ids,
         "lineage_complete_count": lineage_ok,
         "lineage_incomplete_count": lineage_bad,
-        "duplicate_signature_warnings": dup_surplus,
+        "duplicate_signatures_in_batch": dup_surplus,
     }
 
 
@@ -694,7 +716,7 @@ def _apply_analysis_to_report(rep: TableReport, analysis: dict[str, Any], dim_id
     rep.missing_dimension_value_id_count = int(analysis["missing_dimension_value_id_rows"])
     rep.lineage_complete_count = int(analysis["lineage_complete_count"])
     rep.lineage_incomplete_count = int(analysis["lineage_incomplete_count"])
-    rep.duplicate_signature_warnings = int(analysis["duplicate_signature_warnings"])
+    rep.duplicate_signatures_in_batch = int(analysis["duplicate_signatures_in_batch"])
 
     if rep.missing_label_count > 0:
         rep.add_warning(
@@ -705,13 +727,141 @@ def _apply_analysis_to_report(rep: TableReport, analysis: dict[str, Any], dim_id
             f"rows with incomplete dimension_value_ids: {rep.missing_dimension_value_id_count} "
             f"(expected {len(dim_ids)} ids per row)"
         )
-    if rep.duplicate_signature_warnings > 0:
-        rep.add_warning(
-            f"duplicate observation_signature surplus rows: {rep.duplicate_signature_warnings} "
-            "(within this batch; possible duplicate facts or flatten bug)"
+    if rep.duplicate_signatures_in_batch > 0:
+        rep.add_hard_fail(
+            f"duplicate_signatures_in_batch={rep.duplicate_signatures_in_batch}: "
+            "flattened rows contain duplicate observation_signature values."
         )
     if rep.lineage_incomplete_count > 0:
         rep.add_warning(f"rows failing lineage completeness check: {rep.lineage_incomplete_count}")
+
+
+def _signature_lookup_transport_size(requested_chunk: int) -> int:
+    """Signatures per HTTP request (cap avoids PostgREST / proxy URL limits on .in_())."""
+    return max(1, min(int(requested_chunk), SIGNATURE_LOOKUP_TRANSPORT_CAP))
+
+
+def _is_missing_observation_signature_column(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if "42703" in msg:
+        return True
+    if "column" in msg and "observation_signature" in msg and (
+        "does not exist" in msg or "undefined column" in msg
+    ):
+        return True
+    return False
+
+
+def _existing_signatures_in_db(
+    client: Client,
+    signatures: list[str],
+    *,
+    chunk_size: int,
+    table_id: str,
+) -> set[str]:
+    """Return which of the given signatures already exist on statistical_observations."""
+    uniq = sorted({s for s in signatures if s})
+    if not uniq:
+        return set()
+    transport = _signature_lookup_transport_size(chunk_size)
+    found: set[str] = set()
+    chunk_index = 0
+    for i in range(0, len(uniq), transport):
+        part = uniq[i : i + transport]
+        n = len(part)
+        try:
+            res = (
+                client.table("statistical_observations")
+                .select("observation_signature")
+                .in_("observation_signature", part)
+                .execute()
+            )
+        except Exception as exc:
+            print(
+                f"existing-signature lookup failed: table_id={table_id} "
+                f"chunk_index={chunk_index} chunk_size={n} "
+                f"(configured --signature-lookup-chunk-size={chunk_size}, "
+                f"transport_cap={SIGNATURE_LOOKUP_TRANSPORT_CAP})",
+                file=sys.stderr,
+            )
+            if _is_missing_observation_signature_column(exc):
+                raise RuntimeError(
+                    f"existing-signature lookup failed for table_id={table_id}: "
+                    f"column observation_signature appears missing. Apply sql/003_statistical_observation_signature.sql. "
+                    f"Original error: {exc}"
+                ) from exc
+            raise RuntimeError(
+                f"existing-signature lookup failed for table_id={table_id} (chunk_index={chunk_index}, "
+                f"chunk_size={n}). This is usually a PostgREST request-size or network issue when filtering many "
+                f"signatures; try lowering --signature-lookup-chunk-size (transport uses at most "
+                f"{SIGNATURE_LOOKUP_TRANSPORT_CAP} signatures per request). Original error: {exc}"
+            ) from exc
+        for r in res.data or []:
+            val = r.get("observation_signature")
+            if isinstance(val, str) and val:
+                found.add(val)
+        chunk_index += 1
+    return found
+
+
+def _filter_rows_by_signature_policy(
+    client: Client,
+    table_id: str,
+    rows: list[dict[str, Any]],
+    args: argparse.Namespace,
+    rep: TableReport,
+) -> list[dict[str, Any]]:
+    """
+    Apply DB signature overlap rules. Mutates rep counters/messages.
+    Returns rows safe to insert (may be empty).
+    """
+    if not rows:
+        return rows
+
+    if rep.duplicate_signatures_in_batch > 0:
+        rep.add_hard_fail(
+            f"duplicate_signatures_in_batch={rep.duplicate_signatures_in_batch}: "
+            "flattened rows contain duplicate observation_signature values; fix source or importer."
+        )
+        return []
+
+    sigs = [_row_observation_signature(r) for r in rows]
+    if any(not s for s in sigs):
+        rep.add_hard_fail("one or more rows are missing observation_signature after flatten")
+        return []
+
+    distinct = list({s for s in sigs})
+    existing = _existing_signatures_in_db(
+        client,
+        distinct,
+        chunk_size=int(args.signature_lookup_chunk_size),
+        table_id=table_id,
+    )
+    if not existing:
+        return rows
+
+    overlap_count = sum(1 for s in sigs if s in existing)
+    if args.skip_existing_signatures:
+        rep.skipped_existing_signatures = overlap_count
+        kept = [r for r in rows if _row_observation_signature(r) not in existing]
+        rep.add_info(
+            f"--skip-existing-signatures: skipped {overlap_count} row(s) whose signature already exists in DB; "
+            f"inserting {len(kept)} row(s)."
+        )
+        return kept
+
+    if args.allow_existing:
+        rep.add_warning(
+            "LEGACY --allow-existing: does not bypass observation_signature uniqueness. "
+            f"{overlap_count} row(s) collide with existing DB signatures. "
+            "Use --skip-existing-signatures to skip those rows, or remove/rename conflicting DB rows."
+        )
+
+    rep.add_hard_fail(
+        f"{overlap_count} row(s) have observation_signature already present in the database "
+        "(unique index). Use --skip-existing-signatures to skip them, or resolve duplicates first."
+    )
+    return []
 
 
 def _existing_observations_count(client: Client, table_id: str, source_file: str) -> int:
@@ -769,7 +919,8 @@ def _print_table_validation_block(table_id: str, rep: TableReport) -> None:
     print(f"  flattened_row_count:        {rep.flattened_row_count}")
     print(f"  skipped_null_count:         {rep.skipped_null_count}")
     print(f"  inserted_row_count:         {rep.inserted_row_count}")
-    print(f"  duplicate_signature_warn:   {rep.duplicate_signature_warnings}")
+    print(f"  duplicate_signatures_in_batch: {rep.duplicate_signatures_in_batch}")
+    print(f"  skipped_existing_signatures:  {rep.skipped_existing_signatures}")
     print(f"  missing_label_cells:        {rep.missing_label_count}")
     print(f"  missing_dim_value_id_rows:  {rep.missing_dimension_value_id_count}")
     print(f"  lineage_complete_rows:      {rep.lineage_complete_count}")
@@ -1002,23 +1153,32 @@ def _process_table_import(
     rep.existing_observations_count = existing
     print(f"  [{table_id}] existing observations in DB (table_id + source_file): {existing}")
 
-    if existing > 0 and not args.allow_existing:
-        msg = (
-            f"refusing import: {existing} existing observation row(s) for table_id={table_id} "
-            f"and source_file={raw_file.name}. Pass --allow-existing to insert anyway, "
-            "or remove/rename conflicting data."
+    if existing > 0 and args.allow_existing:
+        rep.add_warning(
+            "LEGACY --allow-existing: this flag no longer permits blind duplicate appends. "
+            f"Found {existing} existing row(s) for this table_id + source_file; imports are gated by "
+            "observation_signature (see migration 003). Prefer --skip-existing-signatures for safe re-runs."
         )
-        rep.add_hard_fail(msg)
+        stats.warnings += 1
+    elif existing > 0:
+        rep.add_info(
+            f"{existing} observation row(s) already exist for this table_id + source_file; "
+            "continuing if observation_signature checks pass (no longer blocked by row count alone)."
+        )
+
+    rows = _filter_rows_by_signature_policy(client, table_id, rows, args, rep)
+    if rep.hard_fails:
         stats.tables_skipped += 1
-        print(f"  [{table_id}] HARD STOP: {msg}", file=sys.stderr)
         _print_table_validation_block(table_id, rep)
         return rep
 
-    if existing > 0 and args.allow_existing:
-        rep.add_warning(
-            f"--allow-existing: {existing} row(s) already present; inserting {len(rows)} additional row(s) (possible duplicates)"
-        )
-        stats.warnings += 1
+    stats.skipped_existing_signatures += rep.skipped_existing_signatures
+
+    if not rows:
+        rep.add_info("no rows left to insert after signature filtering")
+        stats.tables_processed += 1
+        _print_table_validation_block(table_id, rep)
+        return rep
 
     inserted = _insert_observations_batched(client, table_id, rows, args.batch_size)
     rep.inserted_row_count = inserted
@@ -1062,7 +1222,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-existing",
         action="store_true",
-        help="Allow import even if observations already exist for same table_id and source_file.",
+        help=(
+            "LEGACY / diagnostic only: suppresses strong row-count context warnings when rows "
+            "already exist for this table_id + source_file. Does NOT bypass observation_signature "
+            "uniqueness; use --skip-existing-signatures for idempotent re-imports."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing-signatures",
+        action="store_true",
+        help=(
+            "Before insert, skip any row whose observation_signature already exists in the database; "
+            "counts toward skipped_existing_signatures. Recommended for controlled re-runs."
+        ),
+    )
+    parser.add_argument(
+        "--signature-lookup-chunk-size",
+        type=int,
+        default=DEFAULT_SIGNATURE_LOOKUP_CHUNK_SIZE,
+        help=(
+            f"Max signatures per logical batch when querying existing observation_signature values "
+            f"(default {DEFAULT_SIGNATURE_LOOKUP_CHUNK_SIZE}). Each HTTP request uses at most "
+            f"{SIGNATURE_LOOKUP_TRANSPORT_CAP} values to avoid PostgREST URL limits; lower this if your "
+            f"gateway still returns 400."
+        ),
     )
     return parser.parse_args()
 
@@ -1077,6 +1260,9 @@ def main() -> int:
         return 1
     if args.validate_only and args.dry_run:
         print("ERROR: use only one of --validate-only or --dry-run", file=sys.stderr)
+        return 1
+    if args.signature_lookup_chunk_size < 1:
+        print("ERROR: --signature-lookup-chunk-size must be >= 1", file=sys.stderr)
         return 1
 
     selected_tables = [args.table] if args.table else TABLE_IDS
@@ -1099,9 +1285,15 @@ def main() -> int:
     print(f"  limit:                  {args.limit}")
     print(f"  batch_size:             {args.batch_size}")
     print(f"  allow_existing:         {args.allow_existing}")
+    print(f"  skip_existing_signatures:{args.skip_existing_signatures}")
+    print(f"  signature_lookup_chunk_size: {args.signature_lookup_chunk_size}")
     print("=" * 60)
 
-    ingest_seed = f"{_now_utc()}|{selected_tables}|{args.limit}|{mode}|{IMPORTER_VERSION}"
+    ingest_seed = (
+        f"{_now_utc()}|{selected_tables}|{args.limit}|{mode}|{IMPORTER_VERSION}|"
+        f"skip_sig={args.skip_existing_signatures}|allow_ex={args.allow_existing}|"
+        f"sig_chunk={args.signature_lookup_chunk_size}"
+    )
     ingestion_batch_id = f"ssb-import-{hashlib.sha1(ingest_seed.encode('utf-8')).hexdigest()[:12]}"
     print(f"ingestion_batch_id: {ingestion_batch_id}")
 
@@ -1161,6 +1353,8 @@ def main() -> int:
         "total_warnings": total_wn,
         "total_infos": total_inf,
         "flattened_rows_sum": sum(tr.flattened_row_count for tr in table_reports),
+        "skipped_existing_signatures": sum(tr.skipped_existing_signatures for tr in table_reports),
+        "duplicate_signatures_in_batch": sum(tr.duplicate_signatures_in_batch for tr in table_reports),
         "exit_code": exit_code,
     }
 
@@ -1170,6 +1364,8 @@ def main() -> int:
     print(f"  total warnings:             {total_wn}")
     print(f"  total infos:                {total_inf}")
     print(f"  flattened rows (sum tables):{totals['flattened_rows_sum']}")
+    print(f"  skipped_existing_signatures: {totals['skipped_existing_signatures']}")
+    print(f"  duplicate_signatures_in_batch: {totals['duplicate_signatures_in_batch']}")
     if not validate_only and not importer_dry_run:
         print(f"  datasets upserted:          {stats.datasets_upserted}")
         print(f"  dimensions upserted:        {stats.dimensions_upserted}")

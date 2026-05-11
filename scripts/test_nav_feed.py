@@ -66,6 +66,37 @@ def _session_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
+def _print_auth_debug(base: str, token: str | None) -> None:
+    """Safe auth debug: never print the full token."""
+    print("\n--- Auth / URL debug (token never printed in full) ---")
+    print(f"Effective base URL: {base}")
+    headers = _session_headers(token)
+    auth_present = "Authorization" in headers
+    print(f"Authorization header will be sent: {auth_present}")
+    if "Authorization" in headers:
+        scheme, _, cred = headers["Authorization"].partition(" ")
+        print(f"Auth header scheme: {scheme.strip() or '(empty)'}")
+        # Never print `cred` (bearer token).
+        if cred:
+            print(f"Bearer credential length: {len(cred)} characters")
+            if len(cred) >= 12:
+                print(f"Bearer credential prefix (6): {cred[:6]}...")
+                print(f"Bearer credential suffix (6): ...{cred[-6:]}")
+            elif len(cred) >= 6:
+                print(
+                    "Bearer credential prefix/suffix: (token 6–11 chars; "
+                    "6+6 preview would overlap — showing length only)"
+                )
+            else:
+                print(
+                    "Bearer credential: (shorter than 6 chars; "
+                    "not printing any fragment)"
+                )
+    else:
+        print("Auth header scheme: (none)")
+    print("--- end auth debug ---\n")
+
+
 def _pick_relevant_headers(response: requests.Response) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in response.headers.items():
@@ -250,6 +281,8 @@ def main() -> int:
     _load_env()
     base = _base_url()
     token = _optional_bearer_token()
+
+    _print_auth_debug(base, token)
 
     if not token:
         print(

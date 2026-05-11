@@ -11,6 +11,7 @@ This document defines the first operational framework for generating `verified_s
 - `docs/scoring-and-signal-model.md`
 - `docs/career-taxonomy-design.md`
 - `docs/ssb-normalization-mvp.md`
+- `docs/verified-statistical-signal-extraction-pilot.md` (read-only preview script + outputs)
 
 ---
 

@@ -9,6 +9,8 @@
 - `docs/ssb-import-validation-checklist.md`
 - `docs/statistical-observation-schema.md`
 - `docs/scoring-and-signal-model.md`
+- `docs/verified-statistical-signal-manual-review-round1.md` (structured manual review of preview samples)
+- `docs/persistent-verified-statistical-signal-model.md` (canonical persistence and governance layer after approval)
 
 **Current preview artifacts (examples for review practice):**
 

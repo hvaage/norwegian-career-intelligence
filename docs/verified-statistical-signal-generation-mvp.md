@@ -12,6 +12,7 @@ This document defines the first operational framework for generating `verified_s
 - `docs/career-taxonomy-design.md`
 - `docs/ssb-normalization-mvp.md`
 - `docs/verified-statistical-signal-extraction-pilot.md` (read-only preview script + outputs)
+- `docs/persistent-verified-statistical-signal-model.md` (persistence and governance boundary after review)
 
 ---
 

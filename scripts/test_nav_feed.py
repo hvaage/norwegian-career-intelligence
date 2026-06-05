@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Technical smoke test for NAV pam-stilling-feed (dev/swagger/test endpoints).
+Technical smoke test for NAV pam-stilling-feed.
 
 References:
   - Swagger: https://pam-stilling-feed.ekstern.dev.nav.no/swagger
@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 
@@ -23,9 +25,10 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
-DEFAULT_BASE_URL = "https://pam-stilling-feed.ekstern.dev.nav.no"
+DEFAULT_BASE_URL = "https://pam-stilling-feed.nav.no"
 FEED_PATH = "/api/v1/feed"
 ENTRY_PATH_TEMPLATE = "/api/v1/feedentry/{entry_id}"
+PUBLIC_TOKEN_PATH = "/api/publicToken"
 
 RELEVANT_HEADER_NAMES = (
     "etag",
@@ -51,12 +54,51 @@ def _base_url() -> str:
     return raw or DEFAULT_BASE_URL
 
 
-def _optional_bearer_token() -> str | None:
-    token = os.environ.get("NAV_FEED_TOKEN")
-    if token is None:
+def _truthy_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_jwt(value: str) -> str | None:
+    match = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+    return match.group(0) if match else None
+
+
+def _fetch_public_token(base: str) -> str | None:
+    url = base.rstrip("/") + PUBLIC_TOKEN_PATH
+    try:
+        response = requests.get(url, timeout=30)
+    except requests.RequestException as exc:
+        print(f"Could not fetch NAV public token: {exc}")
         return None
-    token = token.strip()
-    return token or None
+    if not response.ok:
+        print(f"NAV public token endpoint returned {response.status_code}.")
+        return None
+    token = _extract_jwt(response.text)
+    if not token:
+        print("NAV public token response did not contain a JWT-looking token.")
+    return token
+
+
+def _optional_bearer_token(base: str) -> tuple[str | None, str]:
+    token = os.environ.get("NAV_FEED_TOKEN")
+    if token is not None:
+        token = token.strip()
+        if token:
+            return token, "NAV_FEED_TOKEN"
+
+    use_public_token = _truthy_env(
+        "NAV_FEED_USE_PUBLIC_TOKEN",
+        default=base.rstrip("/") == DEFAULT_BASE_URL,
+    )
+    if use_public_token:
+        public_token = _fetch_public_token(base)
+        if public_token:
+            return public_token, "NAV public token"
+
+    return None, "none"
 
 
 def _session_headers(token: str | None) -> dict[str, str]:
@@ -66,10 +108,11 @@ def _session_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
-def _print_auth_debug(base: str, token: str | None) -> None:
+def _print_auth_debug(base: str, token: str | None, token_source: str) -> None:
     """Safe auth debug: never print the full token."""
     print("\n--- Auth / URL debug (token never printed in full) ---")
     print(f"Effective base URL: {base}")
+    print(f"Token source: {token_source}")
     headers = _session_headers(token)
     auth_present = "Authorization" in headers
     print(f"Authorization header will be sent: {auth_present}")
@@ -131,29 +174,32 @@ def _extract_feed_items(data: Any) -> list[Any] | None:
     return None
 
 
-def _entry_id_from_item(item: Any) -> str | None:
+def _entry_path_from_item(item: Any) -> str | None:
     if not isinstance(item, dict):
         return None
+    url = item.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
     for key in ("id", "uuid", "entryId", "entry_id"):
         val = item.get(key)
         if isinstance(val, str) and val.strip():
-            return val.strip()
+            return ENTRY_PATH_TEMPLATE.format(entry_id=val.strip())
     nested = item.get("_feed_entry")
     if isinstance(nested, dict):
         for key in ("id", "uuid"):
             val = nested.get(key)
             if isinstance(val, str) and val.strip():
-                return val.strip()
+                return ENTRY_PATH_TEMPLATE.format(entry_id=val.strip())
     return None
 
 
-def _first_entry_id(items: list[Any] | None) -> str | None:
+def _first_entry_path(items: list[Any] | None) -> str | None:
     if not items:
         return None
     for item in items:
-        eid = _entry_id_from_item(item)
-        if eid:
-            return eid
+        path = _entry_path_from_item(item)
+        if path:
+            return path
     return None
 
 
@@ -225,28 +271,27 @@ def _run_feed(session: requests.Session, base: str, token: str | None) -> tuple[
             except (TypeError, ValueError):
                 print(repr(entry)[:4000])
 
-    entry_id = _first_entry_id(items)
-    if entry_id:
-        print(f"\nDetected feed entry id: {entry_id}")
+    entry_path = _first_entry_path(items)
+    if entry_path:
+        print(f"\nDetected feed entry path: {entry_path}")
     else:
-        print("\nNo feed entry id detected from first items.")
+        print("\nNo feed entry path detected from first items.")
 
     _print_auth_hint(response.status_code, had_token)
 
     out_path = _project_root() / "data" / "raw" / "sample_feed.json"
     _write_raw(out_path, response)
 
-    return data, entry_id
+    return data, entry_path
 
 
 def _run_entry(
     session: requests.Session,
     base: str,
-    entry_id: str,
+    entry_path: str,
     token: str | None,
 ) -> None:
-    path = ENTRY_PATH_TEMPLATE.format(entry_id=entry_id)
-    url = base.rstrip("/") + path
+    url = urljoin(base.rstrip("/") + "/", entry_path.lstrip("/"))
     print(f"\nGET {url}")
     had_token = bool(token)
     try:
@@ -280,9 +325,9 @@ def _run_entry(
 def main() -> int:
     _load_env()
     base = _base_url()
-    token = _optional_bearer_token()
+    token, token_source = _optional_bearer_token(base)
 
-    _print_auth_debug(base, token)
+    _print_auth_debug(base, token, token_source)
 
     if not token:
         print(
@@ -293,12 +338,18 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(_session_headers(token))
 
-    _data, entry_id = _run_feed(session, base, token)
-    if entry_id:
-        _run_entry(session, base, entry_id, token)
+    data, entry_path = _run_feed(session, base, token)
+    items = _extract_feed_items(data)
+    if items is None:
+        print("\nSmoke test failed: feed response did not contain an 'items' list.")
+        return 1
+
+    if entry_path:
+        _run_entry(session, base, entry_path, token)
     else:
-        print("\nSkipping feedentry request (no entry id).")
+        print("\nSkipping feedentry request (no entry path).")
         print("sample_entry.json was not written (no GET /api/v1/feedentry/... call).")
+        return 1
 
     return 0
 

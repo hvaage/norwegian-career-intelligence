@@ -1,0 +1,73 @@
+name: NAV job feed ingest
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "nav-feed mode"
+        required: false
+        default: "backfill"
+        type: choice
+        options:
+          - backfill
+          - sync
+          - enrich_active
+      max_pages:
+        description: "Pages to process for backfill/sync"
+        required: false
+        default: "5"
+      batch_size:
+        description: "Rows to process for enrich_active"
+        required: false
+        default: "250"
+  schedule:
+    # Continue NAV vacancy backfill in small, replay-safe increments.
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: nav-job-feed-ingest
+  cancel-in-progress: false
+
+jobs:
+  nav-job-feed-ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NAV_FEED_FUNCTION_URL: https://rcqnuzplpncnkjmldwqs.supabase.co/functions/v1/nav-feed
+      NAV_FEED_API_KEY: ${{ secrets.NAV_FEED_API_KEY }}
+      INPUT_MODE: ${{ inputs.mode }}
+      INPUT_MAX_PAGES: ${{ inputs.max_pages }}
+      INPUT_BATCH_SIZE: ${{ inputs.batch_size }}
+
+    steps:
+      - name: Invoke NAV feed importer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mode="${INPUT_MODE:-backfill}"
+          max_pages="${INPUT_MAX_PAGES:-5}"
+          batch_size="${INPUT_BATCH_SIZE:-250}"
+
+          headers=(-H "Content-Type: application/json")
+          if [[ -n "${NAV_FEED_API_KEY:-}" ]]; then
+            headers+=(-H "apikey: ${NAV_FEED_API_KEY}")
+          fi
+
+          if [[ "${mode}" == "enrich_active" ]]; then
+            payload="$(jq -nc --arg mode "${mode}" --argjson batchSize "${batch_size}" \
+              '{mode: $mode, batchSize: $batchSize}')"
+          else
+            payload="$(jq -nc --arg mode "${mode}" --argjson maxPages "${max_pages}" \
+              '{mode: $mode, maxPages: $maxPages}')"
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 20 --max-time 240 \
+            -X POST "${NAV_FEED_FUNCTION_URL}" \
+            "${headers[@]}" \
+            --data "${payload}" \
+            --output response.json
+
+          cat response.json
+          jq -e '.ok == true' response.json >/dev/null

@@ -2,13 +2,14 @@
 
 ## Purpose
 
-This document describes how we verify connectivity and response shape against NAV's **pam-stilling-feed** before a production API token is available. The goal is a small, repeatable technical test—not full ingestion, Supabase, or AI extraction.
+This document describes how we verify connectivity and response shape against NAV's **pam-stilling-feed** before a full production ingestion module is available. The goal is a small, repeatable technical test—not full ingestion, Supabase, or AI extraction.
 
 Official references:
 
 - [Swagger (dev)](https://pam-stilling-feed.ekstern.dev.nav.no/swagger)
 - [OpenAPI JSON](https://pam-stilling-feed.ekstern.dev.nav.no/api/openapi.json)
 - [Product documentation](https://navikt.github.io/pam-stilling-feed/)
+- Production feed host: `https://pam-stilling-feed.nav.no`
 
 ## How to run
 
@@ -23,8 +24,12 @@ Official references:
 
 2. **Configuration (optional)**
 
-   Copy `.env.example` to `.env` and set variables as needed.  
-   `NAV_FEED_BASE_URL` defaults to the dev host if unset.
+   Copy `.env.example` to `.env` and set variables as needed.
+   `NAV_FEED_BASE_URL` defaults to the production host if unset.
+   If `NAV_FEED_TOKEN` is unset on the production host, the smoke test fetches
+   NAV's current public token from `/api/publicToken`. The public token rotates
+   irregularly and is suitable for experiments/smoke tests; a registered private
+   token should be used for durable production ingestion.
 
 3. **Execute the smoke test**
 
@@ -39,9 +44,9 @@ Official references:
 
 ## Expected outcomes
 
-- **With a valid Bearer token** (when the environment requires it): HTTP 200 on `/api/v1/feed`, JSON with top-level keys including `items` (per OpenAPI `Feed` schema). The script prints URL, status, selected headers (`ETag`, `Last-Modified`, `Content-Type`, `Link`, etc.), keys, and the first three `items`. It detects an entry `id` from an item, then calls `/api/v1/feedentry/{entryId}` and saves both raw files.
+- **With a valid Bearer token** or the current NAV public token: HTTP 200 on `/api/v1/feed`, JSON with top-level keys including `items` (per OpenAPI `Feed` schema). The script prints URL, status, selected headers (`ETag`, `Last-Modified`, `Content-Type`, `Link`, etc.), keys, and the first three `items`. It detects an entry URL/path from the first item, calls that entry endpoint, and saves both raw files.
 
-- **Without a token** (or wrong token): the current **dev** host typically returns **401** with a small JSON body (for example `title`, `status`, `type`, `details`) rather than a `Feed` with `items`. The script still reports status, relevant headers, top-level keys, and saves `sample_feed.json` for inspection. It prints explicit guidance about `NAV_FEED_TOKEN` when auth fails.
+- **Without a token** (or wrong token): the API typically returns **401** with a small JSON body (for example `title`, `status`, `type`, `details`) rather than a `Feed` with `items`. The script reports status, relevant headers, top-level keys, and saves `sample_feed.json` for inspection. It exits non-zero when no `items` list is present.
 
 - **Wrong or expired token**: **401**/**403** with a token set — the script suggests verifying the token value and validity.
 
@@ -51,7 +56,7 @@ Official references:
 
 ## Next steps after the NAV token is received
 
-1. Confirm the same script against the **production** base URL (set `NAV_FEED_BASE_URL` accordingly) and validate 200 responses end-to-end.
+1. Keep the smoke test green against the **production** base URL.
 2. Design **pagination**: follow `next_url` / `next_id` from the `Feed` object (see OpenAPI) and persist cursors or ETags for incremental pulls.
 3. Add a dedicated **ingestion module** (out of scope for this test): download pages, store immutable raw JSON, then normalize in a separate step.
 4. Harden operations: retries, backoff, structured logging, and metrics—still without coupling this smoke test to storage or AI.

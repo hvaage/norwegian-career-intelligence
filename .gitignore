@@ -4,5 +4,8 @@ __pycache__/
 .env
 data/raw/
 data/processed/
+# Tracked template only (persistence MVP manual review decisions)
+!data/processed/persistent_signal_preview/
+!data/processed/persistent_signal_preview/manual_review_decisions.example.csv
 .DS_Store
 .env

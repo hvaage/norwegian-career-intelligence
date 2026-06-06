@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="no">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NAV-stillinger</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #fafafa;
+        --card: #fff;
+        --border: #e4e4e7;
+        --text: #18181b;
+        --muted: #71717a;
+        --accent: #1d4ed8;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+      }
+      header {
+        background: var(--card);
+        border-bottom: 1px solid var(--border);
+        padding: 1.25rem 1rem;
+      }
+      .wrap {
+        max-width: 52rem;
+        margin: 0 auto;
+        padding: 0 1rem;
+      }
+      h1 {
+        margin: 0 0 0.25rem;
+        font-size: 1.5rem;
+      }
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      main {
+        padding: 1.25rem 0 2rem;
+      }
+      .config {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1.25rem;
+      }
+      .config summary {
+        cursor: pointer;
+        font-weight: 600;
+      }
+      label {
+        display: block;
+        margin-top: 0.75rem;
+        font-weight: 600;
+        font-size: 0.9rem;
+      }
+      input {
+        width: 100%;
+        padding: 0.45rem 0.5rem;
+        margin-top: 0.25rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font: inherit;
+      }
+      button {
+        margin-top: 0.75rem;
+        padding: 0.45rem 0.9rem;
+        font: inherit;
+        cursor: pointer;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--card);
+      }
+      button.primary {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+      }
+      .meta {
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin-bottom: 1rem;
+      }
+      .error {
+        color: #b91c1c;
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        margin-bottom: 1rem;
+      }
+      .jobs {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      .job {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1rem 1.1rem;
+      }
+      .job h2 {
+        margin: 0 0 0.35rem;
+        font-size: 1.1rem;
+      }
+      .job h2 a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .job h2 a:hover {
+        color: var(--accent);
+        text-decoration: underline;
+      }
+      .company {
+        font-weight: 500;
+        margin: 0 0 0.15rem;
+      }
+      .location {
+        color: var(--muted);
+        margin: 0 0 0.5rem;
+        font-size: 0.95rem;
+      }
+      .dates {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem 1rem;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      .empty {
+        color: var(--muted);
+        padding: 2rem 0;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap">
+        <h1>NAV-stillinger</h1>
+        <p class="subtitle">
+          Viser kun gyldige, aktuelle stillinger fra <code>valid_nav_jobs</code>
+        </p>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <details class="config" id="configPanel">
+        <summary>Tilkobling (Supabase)</summary>
+        <label for="supabaseUrl">Supabase URL</label>
+        <input
+          id="supabaseUrl"
+          type="url"
+          placeholder="https://xxxx.supabase.co"
+          autocomplete="off"
+        />
+        <label for="anonKey">Supabase anon key</label>
+        <input
+          id="anonKey"
+          type="password"
+          placeholder="eyJ..."
+          autocomplete="off"
+        />
+        <button type="button" class="primary" id="saveBtn">Lagre og last inn</button>
+      </details>
+
+      <p class="meta" id="statusMeta">Laster…</p>
+      <div id="errorBox" class="error" hidden></div>
+      <ul class="jobs" id="jobList" aria-live="polite"></ul>
+      <p class="empty" id="emptyState" hidden>Ingen gyldige NAV-stillinger funnet.</p>
+    </main>
+
+    <script type="module">
+      import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+
+      const LS_URL = "nav_test_supabase_url";
+      const LS_KEY = "nav_test_anon_key";
+
+      const urlInput = document.getElementById("supabaseUrl");
+      const keyInput = document.getElementById("anonKey");
+      const saveBtn = document.getElementById("saveBtn");
+      const statusMeta = document.getElementById("statusMeta");
+      const errorBox = document.getElementById("errorBox");
+      const jobList = document.getElementById("jobList");
+      const emptyState = document.getElementById("emptyState");
+
+      function normalizeSupabaseBaseUrl(input) {
+        let raw = (input || "").trim();
+        if (!raw) return "";
+        if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+        try {
+          const u = new URL(raw);
+          return `${u.protocol}//${u.host}`;
+        } catch {
+          return raw
+            .replace(/\/+$/, "")
+            .replace(/\/rest\/v1\/?.*$/i, "")
+            .replace(/\/functions\/v1\/?.*$/i, "");
+        }
+      }
+
+      function formatDateTime(iso) {
+        if (!iso) return null;
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return iso;
+        return d.toLocaleString("nb-NO", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        });
+      }
+
+      function formatDateOnly(value) {
+        if (!value) return null;
+        const d = new Date(`${String(value).slice(0, 10)}T12:00:00`);
+        if (Number.isNaN(d.getTime())) return value;
+        return d.toLocaleDateString("nb-NO", { dateStyle: "medium" });
+      }
+
+      function escapeHtml(text) {
+        return String(text ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function renderJobs(jobs) {
+        jobList.innerHTML = "";
+        if (!jobs.length) {
+          emptyState.hidden = false;
+          return;
+        }
+        emptyState.hidden = true;
+
+        for (const job of jobs) {
+          const li = document.createElement("li");
+          li.className = "job";
+          const title = escapeHtml(job.title || "Uten tittel");
+          const company = escapeHtml(job.company_name || "Ukjent arbeidsgiver");
+          const location = job.location
+            ? `<p class="location">${escapeHtml(job.location)}</p>`
+            : "";
+          const published = formatDateTime(job.published_at);
+          const due = formatDateOnly(job.application_due);
+          const link = job.url
+            ? `<h2><a href="${escapeHtml(job.url)}" target="_blank" rel="noopener noreferrer">${title}</a></h2>`
+            : `<h2>${title}</h2>`;
+
+          const dateParts = [];
+          if (published) dateParts.push(`Publisert: ${escapeHtml(published)}`);
+          if (due) dateParts.push(`Søknadsfrist: ${escapeHtml(due)}`);
+
+          li.innerHTML = `
+            ${link}
+            <p class="company">${company}</p>
+            ${location}
+            <div class="dates">${dateParts.map((p) => `<span>${p}</span>`).join("")}</div>
+          `;
+          jobList.appendChild(li);
+        }
+      }
+
+      async function loadJobs() {
+        errorBox.hidden = true;
+        statusMeta.textContent = "Laster stillinger…";
+        jobList.innerHTML = "";
+        emptyState.hidden = true;
+
+        const base = normalizeSupabaseBaseUrl(urlInput.value);
+        const anon = keyInput.value.trim();
+        if (!base || !anon) {
+          statusMeta.textContent =
+            "Fyll inn Supabase URL og anon key under Tilkobling.";
+          return;
+        }
+
+        const supabase = createClient(base, anon);
+        const { data, error } = await supabase
+          .from("valid_nav_jobs")
+          .select("title, company_name, location, published_at, application_due, url")
+          .order("published_at", { ascending: false });
+
+        if (error) {
+          errorBox.hidden = false;
+          errorBox.textContent = `Kunne ikke hente stillinger: ${error.message}`;
+          statusMeta.textContent = "Feil ved lasting.";
+          return;
+        }
+
+        const jobs = data ?? [];
+        statusMeta.textContent = `${jobs.length} gyldige NAV-stillinger (sortert etter publisert dato)`;
+        renderJobs(jobs);
+      }
+
+      function saveConfig() {
+        const normalized = normalizeSupabaseBaseUrl(urlInput.value);
+        if (normalized) {
+          localStorage.setItem(LS_URL, normalized);
+          urlInput.value = normalized;
+        }
+        localStorage.setItem(LS_KEY, keyInput.value.trim());
+      }
+
+      urlInput.value =
+        normalizeSupabaseBaseUrl(localStorage.getItem(LS_URL) || "") ||
+        localStorage.getItem(LS_URL) ||
+        "";
+      keyInput.value = localStorage.getItem(LS_KEY) || "";
+
+      saveBtn.addEventListener("click", () => {
+        saveConfig();
+        loadJobs();
+      });
+
+      if (urlInput.value && keyInput.value) {
+        loadJobs();
+      } else {
+        statusMeta.textContent =
+          "Konfigurer Supabase under Tilkobling for å vise stillinger.";
+        document.getElementById("configPanel").open = true;
+      }
+    </script>
+  </body>
+</html>

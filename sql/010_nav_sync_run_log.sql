@@ -1,0 +1,2 @@
+-- Mirror: supabase/migrations/20260518180000_nav_sync_run_log.sql
+-- See supabase/migrations for nav_sync_run_log and nav_sync_status.

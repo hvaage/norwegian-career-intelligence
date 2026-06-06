@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="no">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Test NAV integrasjon</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 52rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.5;
+      }
+      label {
+        display: block;
+        margin-top: 0.75rem;
+        font-weight: 600;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.4rem 0.5rem;
+        margin-top: 0.25rem;
+      }
+      button {
+        margin-top: 1rem;
+        padding: 0.5rem 1rem;
+        font-size: 1rem;
+        cursor: pointer;
+      }
+      pre {
+        background: #f4f4f5;
+        padding: 1rem;
+        overflow: auto;
+        border-radius: 6px;
+        font-size: 0.85rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      h2 {
+        margin-top: 1.5rem;
+        font-size: 1.1rem;
+      }
+      .ok {
+        color: #166534;
+      }
+      .err {
+        color: #b91c1c;
+      }
+      code {
+        font-size: 0.9em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>NAV stillingsfeed — test</h1>
+    <p>
+      Kaller <code>POST …/functions/v1/nav-feed</code> eller
+      <code>nav-feed-enrich</code> med anon key.
+      NAV-token sendes <strong>ikke</strong> fra nettleseren.
+    </p>
+
+    <label for="supabaseUrl">Supabase URL</label>
+    <input
+      id="supabaseUrl"
+      type="url"
+      placeholder="https://xxxx.supabase.co"
+      autocomplete="off"
+    />
+    <p style="font-size: 0.9rem; color: #52525b">
+      Lim inn <strong>Project URL</strong> fra Supabase (f.eks.
+      <code>https://xxxx.supabase.co</code>). Hvis du har limt inn
+      <code>/rest/v1</code> ved en feil, normaliseres den bort automatisk.
+    </p>
+
+    <h2>Request URL (Edge Function)</h2>
+    <pre id="requestUrlPreview">https://&lt;project&gt;.supabase.co/functions/v1/nav-feed</pre>
+
+    <label for="mode">Modus</label>
+    <select id="mode">
+      <option value="backfill" selected>backfill (full historikk, batch)</option>
+      <option value="sync">sync (inkrementell)</option>
+      <option value="test_feedentry">test_feedentry (dato-felter i detail)</option>
+      <option value="enrich">enrich (reparer ACTIVE-datoer)</option>
+    </select>
+
+    <div id="feedEntryIdGroup">
+      <label for="feedEntryId">feedEntryId (kun test_feedentry)</label>
+      <input
+        id="feedEntryId"
+        type="text"
+        value="aacf9c18-bcef-48c0-968e-238c5b88eff4"
+        autocomplete="off"
+      />
+    </div>
+
+    <label for="maxPages" id="maxPagesLabel">maxPages (sider per kjøring)</label>
+    <input
+      id="maxPages"
+      type="number"
+      min="1"
+      max="500"
+      value="25"
+    />
+    <p id="maxPagesHint" style="font-size: 0.9rem; color: #52525b">
+      Kjør backfill i batcher (f.eks. 25–50) for å unngå timeout. Fortsett med
+      samme modus til <code>finished</code> er true.
+    </p>
+
+    <label for="anonKey">Supabase anon key</label>
+    <input
+      id="anonKey"
+      type="password"
+      placeholder="eyJ..."
+      autocomplete="off"
+    />
+
+    <button type="button" id="testBtn">Test NAV integrasjon</button>
+
+    <h2>Oppsummert resultat</h2>
+    <pre id="summary">(ingen test kjørt ennå)</pre>
+
+    <h2>Fetch (nettverk)</h2>
+    <pre id="fetchMeta">—</pre>
+
+    <h2>Response headers</h2>
+    <pre id="resHeaders">—</pre>
+
+    <h2>Raw response text</h2>
+    <pre id="rawText">—</pre>
+
+    <h2>Parsed JSON</h2>
+    <pre id="parsedJson">—</pre>
+
+    <h2>JSON parse error</h2>
+    <pre id="parseError">—</pre>
+
+    <script>
+      const LS_URL = "nav_test_supabase_url";
+      const LS_KEY = "nav_test_anon_key";
+      const LS_MODE = "nav_test_mode";
+      const LS_MAX_PAGES = "nav_test_max_pages";
+
+      const urlInput = document.getElementById("supabaseUrl");
+      const modeInput = document.getElementById("mode");
+      const feedEntryIdGroup = document.getElementById("feedEntryIdGroup");
+      const feedEntryIdInput = document.getElementById("feedEntryId");
+      const maxPagesInput = document.getElementById("maxPages");
+      const maxPagesLabel = document.getElementById("maxPagesLabel");
+      const maxPagesHint = document.getElementById("maxPagesHint");
+      const keyInput = document.getElementById("anonKey");
+      const requestUrlPreview = document.getElementById("requestUrlPreview");
+      const summary = document.getElementById("summary");
+      const fetchMeta = document.getElementById("fetchMeta");
+      const resHeaders = document.getElementById("resHeaders");
+      const rawText = document.getElementById("rawText");
+      const parsedJson = document.getElementById("parsedJson");
+      const parseError = document.getElementById("parseError");
+      const testBtn = document.getElementById("testBtn");
+
+      /**
+       * Normaliser til prosjekt-root: https://xxxx.supabase.co
+       * (fjerner /rest/v1, /auth/v1, paths og trailing slash).
+       */
+      function normalizeSupabaseBaseUrl(input) {
+        let raw = (input || "").trim();
+        if (!raw) return "";
+
+        if (!/^https?:\/\//i.test(raw)) {
+          raw = `https://${raw}`;
+        }
+
+        try {
+          const u = new URL(raw);
+          return `${u.protocol}//${u.host}`;
+        } catch {
+          return raw
+            .replace(/\/+$/, "")
+            .replace(/\/rest\/v1\/?.*$/i, "")
+            .replace(/\/auth\/v1\/?.*$/i, "")
+            .replace(/\/functions\/v1\/?.*$/i, "");
+        }
+      }
+
+      function functionSlugForMode(mode) {
+        return mode === "enrich" ? "nav-feed-enrich" : "nav-feed";
+      }
+
+      function buildFunctionUrl(input, mode) {
+        const base = normalizeSupabaseBaseUrl(input);
+        if (!base) return "";
+        return `${base}/functions/v1/${functionSlugForMode(mode)}`;
+      }
+
+      function updateModeUi() {
+        const isEnrich = modeInput.value === "enrich";
+        const isTestEntry = modeInput.value === "test_feedentry";
+        feedEntryIdGroup.style.display = isTestEntry ? "block" : "none";
+        maxPagesLabel.textContent = isEnrich
+          ? "maxRows (rader per kjøring)"
+          : "maxPages (sider per kjøring)";
+        maxPagesHint.textContent = isEnrich
+          ? "Henter NAV detail for opptil maxRows ACTIVE-stillinger som mangler datoer. Kjør på nytt til remainingWithoutDates er 0."
+          : "Kjør backfill i batcher (f.eks. 25–50) for å unngå timeout. Fortsett med samme modus til finished er true.";
+        if (isEnrich && Number(maxPagesInput.value) > 100) {
+          maxPagesInput.value = "100";
+        }
+        updateUrlHint();
+      }
+
+      function updateUrlHint() {
+        const fnUrl = buildFunctionUrl(urlInput.value, modeInput.value);
+        requestUrlPreview.textContent = fnUrl ||
+          "https://<project>.supabase.co/functions/v1/nav-feed";
+      }
+
+      const storedUrl = localStorage.getItem(LS_URL) || "";
+      urlInput.value = normalizeSupabaseBaseUrl(storedUrl) || storedUrl;
+      keyInput.value = localStorage.getItem(LS_KEY) || "";
+      modeInput.value = localStorage.getItem(LS_MODE) || "backfill";
+      maxPagesInput.value = localStorage.getItem(LS_MAX_PAGES) || "25";
+
+      urlInput.addEventListener("input", updateUrlHint);
+      modeInput.addEventListener("change", updateModeUi);
+      updateModeUi();
+
+      function saveConfig() {
+        const normalized = normalizeSupabaseBaseUrl(urlInput.value);
+        if (normalized) {
+          localStorage.setItem(LS_URL, normalized);
+          urlInput.value = normalized;
+        } else {
+          localStorage.setItem(LS_URL, urlInput.value.trim());
+        }
+        localStorage.setItem(LS_KEY, keyInput.value.trim());
+        localStorage.setItem(LS_MODE, modeInput.value);
+        localStorage.setItem(LS_MAX_PAGES, maxPagesInput.value);
+        updateUrlHint();
+      }
+
+      function formatSummary(data) {
+        if (!data || typeof data !== "object") {
+          return "Ingen gyldig JSON-objekt i respons (se raw text).";
+        }
+        if (data.candidatesFound !== undefined && data.remainingWithoutDates !== undefined) {
+          const lines = [
+            `OK: ${data.ok}`,
+            `Modus: enrich`,
+            `Kandidater totalt: ${data.candidatesFound ?? 0}`,
+            `Oppdatert denne kjøringen: ${data.updatedCount ?? 0}`,
+            `Feilet: ${data.failedCount ?? 0}`,
+            `published_at funnet: ${data.publishedFoundCount ?? 0}`,
+            `application_due funnet: ${data.applicationDueFoundCount ?? 0}`,
+            `Gjenstår uten full dato: ${data.remainingWithoutDates ?? 0}`,
+          ];
+          if (data.error) lines.push(`Feil: ${data.error}`);
+          return lines.join("\n");
+        }
+        if (data.mode === "test_feedentry") {
+          const lines = [
+            `OK: ${data.ok}`,
+            `Modus: test_feedentry`,
+            `feedEntryId: ${data.feedEntryId ?? "(mangler)"}`,
+            `HTTP: ${data.httpStatus ?? "(mangler)"}`,
+            `Toppnivå-nøkler: ${(data.topLevelKeys || []).join(", ") || "(ingen)"}`,
+            `Konklusjon: ${data.conclusion ?? "(mangler)"}`,
+          ];
+          if (Array.isArray(data.dateFieldsFound) && data.dateFieldsFound.length) {
+            lines.push("", "Datofelter funnet:");
+            for (const hit of data.dateFieldsFound) {
+              lines.push(`  - ${hit.path}: ${hit.value}`);
+            }
+          } else {
+            lines.push("", "Datofelter funnet: (ingen)");
+          }
+          if (Array.isArray(data.suggestedMapping) && data.suggestedMapping.length) {
+            lines.push("", "Foreslått mapping (ikke i produksjon ennå):");
+            for (const m of data.suggestedMapping) {
+              lines.push(`  - ${m.jobOpportunitiesColumn} ← ${m.sourcePath} (${m.sampleValue})`);
+            }
+          }
+          if (data.error) lines.push(`Feil: ${data.error}`);
+          lines.push("", "Full detail: se Parsed JSON (rawPreview).");
+          return lines.join("\n");
+        }
+        const lines = [
+          `OK: ${data.ok}`,
+          `Modus: ${data.mode ?? "(mangler)"}`,
+          `Ferdig (ingen flere sider): ${data.finished === true ? "ja" : data.finished === false ? "nei — fortsett" : "(mangler)"}`,
+          `Sider hentet denne kjøringen: ${data.pagesFetched ?? "(mangler)"}`,
+          `Antall hentet (denne kjøringen): ${data.fetchedCount ?? "(mangler)"}`,
+          `ACTIVE på sidene: ${data.activeCount ?? "(mangler)"}`,
+          `INACTIVE på sidene: ${data.inactiveCount ?? "(mangler)"}`,
+          `Antall importert (nye): ${data.insertedCount ?? 0}`,
+          `Antall oppdatert: ${data.updatedCount ?? 0}`,
+          `Antall hoppet over (mangler id): ${data.skippedCount ?? 0}`,
+          `ACTIVE detail hentet: ${data.activeDetailFetchedCount ?? 0}`,
+          `ACTIVE detail feilet: ${data.activeDetailFailedCount ?? 0}`,
+          `published_at funnet: ${data.publishedDateFoundCount ?? 0}`,
+          `application_due funnet: ${data.applicationDueFoundCount ?? 0}`,
+          `lastNextUrl (fortsett her): ${data.lastNextUrl ?? "(null — ferdig eller ikke startet)"}`,
+        ];
+        if (data.error) lines.push(`Feil: ${data.error}`);
+        return lines.join("\n");
+      }
+
+      function headersToObject(res) {
+        const out = {};
+        res.headers.forEach((v, k) => {
+          out[k] = v;
+        });
+        return out;
+      }
+
+      testBtn.addEventListener("click", async () => {
+        saveConfig();
+        const anon = keyInput.value.trim();
+        const url = buildFunctionUrl(urlInput.value, modeInput.value);
+        if (!url || !anon) {
+          summary.textContent =
+            "Fyll inn Supabase URL og anon key (fra .env / Supabase dashboard).";
+          summary.className = "err";
+          return;
+        }
+
+        updateUrlHint();
+        summary.textContent = "Henter…";
+        summary.className = "";
+        fetchMeta.textContent = "…";
+        resHeaders.textContent = "…";
+        rawText.textContent = "…";
+        parsedJson.textContent = "…";
+        parseError.textContent = "(ingen)";
+
+        try {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${anon}`,
+              apikey: anon,
+            },
+            body: JSON.stringify(
+              modeInput.value === "enrich"
+                ? { maxRows: Number(maxPagesInput.value) || 100 }
+                : modeInput.value === "test_feedentry"
+                  ? {
+                      mode: "test_feedentry",
+                      feedEntryId: feedEntryIdInput.value.trim(),
+                    }
+                  : {
+                      mode: modeInput.value,
+                      maxPages: Number(maxPagesInput.value) || 25,
+                    }
+            ),
+          });
+
+          const text = await res.text();
+
+          fetchMeta.textContent = [
+            `Request URL: ${url}`,
+            `Request method: POST`,
+            `Fetch HTTP status: ${res.status} ${res.statusText}`,
+            `Response ok: ${res.ok}`,
+          ].join("\n");
+
+          resHeaders.textContent = JSON.stringify(headersToObject(res), null, 2);
+          rawText.textContent = text || "(tom body)";
+
+          let data = null;
+          try {
+            data = text ? JSON.parse(text) : null;
+            parsedJson.textContent = JSON.stringify(data, null, 2);
+            parseError.textContent = "(ingen)";
+          } catch (e) {
+            parsedJson.textContent = "(kunne ikke parse)";
+            parseError.textContent = String(e.message || e);
+            data = null;
+          }
+
+          summary.textContent = formatSummary(data);
+          summary.className = data && data.ok === true ? "ok" : "err";
+        } catch (e) {
+          fetchMeta.textContent = `Nettverksfeil før respons: ${e.message}`;
+          resHeaders.textContent = "—";
+          rawText.textContent = "—";
+          parsedJson.textContent = "—";
+          parseError.textContent = String(e.message || e);
+          summary.textContent = `Nettverksfeil: ${e.message}`;
+          summary.className = "err";
+        }
+      });
+    </script>
+  </body>
+</html>

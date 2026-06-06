@@ -237,6 +237,18 @@ def _run_feed(session: requests.Session, base: str, token: str | None) -> tuple[
         print(f"Request failed: {exc}")
         return None, None
 
+    if response.status_code in (401, 403) and had_token:
+        err_snip = response.text[:500]
+        print(f"Auth failed ({response.status_code}); body snippet:\n{err_snip}")
+        print("Public token may be rotated — fetching fresh token from /api/publicToken")
+        fresh = _fetch_public_token(base)
+        if fresh:
+            session.headers["Authorization"] = f"Bearer {fresh}"
+            response = session.get(url, timeout=60)
+            print(f"Retry status: {response.status_code}")
+        else:
+            print("publicToken refresh failed.")
+
     print(f"Status: {response.status_code}")
     for k, v in sorted(_pick_relevant_headers(response).items()):
         print(f"  {k}: {v}")
@@ -328,12 +340,6 @@ def main() -> int:
     token, token_source = _optional_bearer_token(base)
 
     _print_auth_debug(base, token, token_source)
-
-    if not token:
-        print(
-            "NAV_FEED_TOKEN is not set (optional). "
-            "The request will be sent without Authorization."
-        )
 
     session = requests.Session()
     session.headers.update(_session_headers(token))

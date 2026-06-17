@@ -122,6 +122,18 @@ type NavFeedItem = {
 
 type NavRawPayload = NavFeedItem & { nav_detail?: NavFeedEntryDetail };
 
+type ExistingJobOpportunityRow = {
+  external_id: string;
+  title: string | null;
+  company_name: string | null;
+  location: string | null;
+  url: string | null;
+  published_at: string | null;
+  expires_at: string | null;
+  application_due: string | null;
+  raw_payload: NavRawPayload | null;
+};
+
 type NavFeedBody = {
   items?: NavFeedItem[];
   next_url?: string | null;
@@ -603,7 +615,8 @@ function mapInactiveRow(item: NavFeedItem): JobOpportunityRow | null {
   const base = mapFeedItemBase(item);
   if (!base) return null;
 
-  const nav_event_modified_at = feedEventModifiedAt(item);
+  const nav_event_modified_at = feedEventModifiedAt(item) ??
+    new Date().toISOString();
 
   return {
     ...base,
@@ -614,6 +627,97 @@ function mapInactiveRow(item: NavFeedItem): JobOpportunityRow | null {
     date_modified: nav_event_modified_at,
     raw_payload: item,
   };
+}
+
+function mergeInactivePayload(
+  existing: NavRawPayload | null | undefined,
+  inactiveEvent: unknown,
+): NavRawPayload {
+  const existingRecord =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {};
+  const eventRecord =
+    inactiveEvent && typeof inactiveEvent === "object" && !Array.isArray(inactiveEvent)
+      ? { ...(inactiveEvent as Record<string, unknown>) }
+      : {};
+
+  return {
+    ...eventRecord,
+    ...existingRecord,
+    nav_inactive_event: inactiveEvent,
+    last_nav_status: "INACTIVE",
+  } as NavRawPayload;
+}
+
+async function upsertInactiveRows(
+  supabase: SupabaseClient,
+  items: NavFeedItem[],
+): Promise<{ insertedCount: number; updatedCount: number; skippedCount: number }> {
+  const inactiveRows = items
+    .map(mapInactiveRow)
+    .filter((row): row is JobOpportunityRow => row !== null);
+
+  if (inactiveRows.length === 0) {
+    return { insertedCount: 0, updatedCount: 0, skippedCount: items.length };
+  }
+
+  const dedupMap = new Map<string, JobOpportunityRow>();
+  for (const row of inactiveRows) {
+    dedupMap.set(row.external_id, row);
+  }
+  const uniqueRows = Array.from(dedupMap.values());
+  const externalIds = uniqueRows.map((row) => row.external_id);
+  const existingMap = new Map<string, ExistingJobOpportunityRow>();
+
+  for (const idChunk of chunk(externalIds, 200)) {
+    const { data, error } = await supabase
+      .from("job_opportunities")
+      .select(
+        "external_id, title, company_name, location, url, published_at, expires_at, application_due, raw_payload",
+      )
+      .eq("source", SOURCE_NAV)
+      .in("external_id", idChunk);
+
+    if (error) {
+      throw new Error(`Kunne ikke slå opp INACTIVE-rader: ${error.message}`);
+    }
+
+    for (const row of data ?? []) {
+      existingMap.set(String(row.external_id), row as ExistingJobOpportunityRow);
+    }
+  }
+
+  let insertedCount = 0;
+  let updatedCount = 0;
+  const rowsToUpsert = uniqueRows.map((row) => {
+    const existing = existingMap.get(row.external_id);
+    if (existing) updatedCount += 1;
+    else insertedCount += 1;
+
+    return {
+      ...row,
+      title: existing?.title ?? row.title,
+      company_name: existing?.company_name ?? row.company_name,
+      location: existing?.location ?? row.location,
+      url: existing?.url ?? row.url,
+      published_at: existing?.published_at ?? row.published_at,
+      expires_at: existing?.expires_at ?? row.expires_at,
+      application_due: existing?.application_due ?? row.application_due,
+      raw_payload: mergeInactivePayload(existing?.raw_payload, row.raw_payload),
+    };
+  });
+
+  for (const batch of chunk(rowsToUpsert, UPSERT_CHUNK)) {
+    const { error } = await supabase
+      .from("job_opportunities")
+      .upsert(batch, { onConflict: "source,external_id" });
+    if (error) {
+      throw new Error(`Supabase INACTIVE upsert feilet: ${error.message}`);
+    }
+  }
+
+  return { insertedCount, updatedCount, skippedCount: items.length - inactiveRows.length };
 }
 
 function mapActiveRowWithoutDetail(item: NavFeedItem): JobOpportunityRow | null {
@@ -698,11 +802,17 @@ async function mapItemsToRows(
   budget: ActiveDetailBudget,
   stats: DetailImportStats,
   supabase: SupabaseClient,
-): Promise<{ token: string; rows: JobOpportunityRow[]; skipped: number; deletedInactive: number }> {
+): Promise<{
+  token: string;
+  rows: JobOpportunityRow[];
+  skipped: number;
+  inactiveInserted: number;
+  inactiveUpdated: number;
+}> {
   const rows: JobOpportunityRow[] = [];
   let skipped = 0;
 
-  const inactiveIds: string[] = [];
+  const inactive: NavFeedItem[] = [];
   const active: NavFeedItem[] = [];
 
   for (const item of items) {
@@ -710,26 +820,12 @@ async function mapItemsToRows(
     if (status === "ACTIVE") {
       active.push(item);
     } else if (status === "INACTIVE" && item.id?.trim()) {
-      inactiveIds.push(item.id.trim());
+      inactive.push(item);
     }
   }
 
-  // Delete any existing rows that are now INACTIVE (handles ACTIVE->INACTIVE transitions)
-  let deletedInactive = 0;
-  if (inactiveIds.length > 0) {
-    for (const idBatch of chunk(inactiveIds, 200)) {
-      const { error, count } = await supabase
-        .from("job_opportunities")
-        .delete({ count: "exact" })
-        .eq("source", SOURCE_NAV)
-        .in("external_id", idBatch);
-      if (error) {
-        console.warn(`[nav-feed] delete INACTIVE failed: ${error.message}`);
-      } else {
-        deletedInactive += count ?? 0;
-      }
-    }
-  }
+  const inactiveResult = await upsertInactiveRows(supabase, inactive);
+  skipped += inactiveResult.skippedCount;
 
   // Active rows: always fetch detail. No budget when we already have only ACTIVE in input.
   for (const item of active) {
@@ -745,7 +841,13 @@ async function mapItemsToRows(
     }
   }
 
-  return { token, rows, skipped, deletedInactive };
+  return {
+    token,
+    rows,
+    skipped,
+    inactiveInserted: inactiveResult.insertedCount,
+    inactiveUpdated: inactiveResult.updatedCount,
+  };
 }
 
 function chunk<T>(arr: T[], size: number): T[][] {
@@ -961,13 +1063,18 @@ async function runFeedImport(
         supabase,
       );
       currentToken = mapped.token;
-      const { rows, skipped: pageSkipped } = mapped;
+      const {
+        rows,
+        skipped: pageSkipped,
+        inactiveInserted,
+        inactiveUpdated,
+      } = mapped;
 
       const { insertedCount, updatedCount } = await upsertJobRows(supabase, rows);
 
       runFetched += items.length;
-      runInserted += insertedCount;
-      runUpdated += updatedCount;
+      runInserted += insertedCount + inactiveInserted;
+      runUpdated += updatedCount + inactiveUpdated;
       runSkipped += pageSkipped;
       runActive += pageActive;
       runInactive += pageInactive;
@@ -979,7 +1086,7 @@ async function runFeedImport(
       lastNextUrl = nextUrl;
 
       console.log(
-        `[nav-feed] page=${pageNum} items=${items.length} ACTIVE=${pageActive} INACTIVE=${pageInactive} skipped=${pageSkipped} insert=${insertedCount} update=${updatedCount} detailFetched=${detailStats.activeDetailFetchedCount} detailBudgetLeft=${detailBudget.remaining} next_url=${nextUrl ? "yes" : "no"}`,
+        `[nav-feed] page=${pageNum} items=${items.length} ACTIVE=${pageActive} INACTIVE=${pageInactive} skipped=${pageSkipped} insert=${insertedCount}+inactive:${inactiveInserted} update=${updatedCount}+inactive:${inactiveUpdated} detailFetched=${detailStats.activeDetailFetchedCount} detailBudgetLeft=${detailBudget.remaining} next_url=${nextUrl ? "yes" : "no"}`,
       );
 
       await persistSyncState(supabase, syncState.id, {
@@ -1150,13 +1257,35 @@ console.log(`[nav-feed] enrich_active: fetched ${missingDetail.length} rows need
       currentToken = fetched.token;
       const detail = fetched.detail;
 
-      // If NAV now reports INACTIVE, delete the row instead of updating
       if (detail.status?.trim() === "INACTIVE") {
-        await supabase
+        const nav_event_modified_at = parseTimestamp(detail.sistEndret) ??
+          new Date().toISOString();
+        const payload = mergeInactivePayload(
+          row.raw_payload as NavRawPayload | null,
+          detail,
+        );
+
+        const { error: inactiveErr } = await supabase
           .from("job_opportunities")
-          .delete()
+          .update({
+            status: "INACTIVE",
+            nav_event_modified_at,
+            date_modified: nav_event_modified_at,
+            raw_payload: payload,
+          })
           .eq("source", SOURCE_NAV)
           .eq("external_id", externalId);
+
+        if (inactiveErr) {
+          console.warn(
+            `[nav-feed] enrich inactive update failed ${externalId}: ${inactiveErr.message}`,
+          );
+          skipped += 1;
+          continue;
+        }
+
+        detailStats.activeDetailFetchedCount += 1;
+        updated += 1;
         continue;
       }
 

@@ -9,3 +9,4 @@ data/processed/
 !data/processed/persistent_signal_preview/manual_review_decisions.example.csv
 .DS_Store
 .env
+supabase/.temp/

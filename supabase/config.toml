@@ -1,6 +1,8 @@
 # Minimal Supabase config for NAV feed Edge Function (local serve / deploy).
 # See: https://supabase.com/docs/guides/functions
 
+project_id = "rcqnuzplpncnkjmldwqs"
+
 # Cron/pg_net uses service secret (sb_secret_*) via apikey header — not a user JWT.
 [functions.nav-feed]
 verify_jwt = false

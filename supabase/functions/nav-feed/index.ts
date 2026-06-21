@@ -66,6 +66,7 @@ type ParsedRequest = RunRequest | TestRequest;
 
 type FeedBody = {
   items?: NavFeedItem[];
+  feed_url?: string | null;
   next_url?: string | null;
 };
 
@@ -795,7 +796,11 @@ async function runSteadySync(
     const nextUrl = typeof body.next_url === "string" && body.next_url.trim()
       ? body.next_url.trim()
       : null;
-    const pollingUrl = nextUrl || fetched.responseUrl;
+    const pageFeedUrl =
+      typeof body.feed_url === "string" && body.feed_url.trim()
+        ? body.feed_url.trim()
+        : fetched.responseUrl;
+    const pollingUrl = nextUrl || pageFeedUrl;
     await updateSyncState(supabase, state.id, {
       feed_url: pollingUrl,
       last_next_url: pollingUrl,
@@ -1034,7 +1039,10 @@ async function runReconcile(
       ? body.next_url.trim()
       : null;
     const patch: Record<string, unknown> = {
-      current_feed_url: nextUrl || fetched.responseUrl,
+      current_feed_url: nextUrl ||
+        (typeof body.feed_url === "string" && body.feed_url.trim()
+          ? body.feed_url.trim()
+          : fetched.responseUrl),
       feed_etag: nextUrl ? null : fetched.etag,
       feed_last_modified: nextUrl ? null : fetched.lastModified,
       pages_fetched: run.pages_fetched + result.pagesFetched,
@@ -1059,7 +1067,10 @@ async function runReconcile(
       throw new Error(`could not persist reconcile cursor: ${error.message}`);
     }
 
-    feedUrl = nextUrl || fetched.responseUrl;
+    feedUrl = nextUrl ||
+      (typeof body.feed_url === "string" && body.feed_url.trim()
+        ? body.feed_url.trim()
+        : fetched.responseUrl);
     if (!nextUrl) break;
   }
 

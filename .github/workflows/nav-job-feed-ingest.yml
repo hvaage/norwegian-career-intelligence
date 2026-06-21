@@ -6,11 +6,12 @@ on:
       mode:
         description: "nav-feed mode"
         required: false
-        default: "backfill"
+        default: "sync"
         type: choice
         options:
           - backfill
           - sync
+          - reconcile
           - enrich_active
       max_pages:
         description: "Pages to process for backfill/sync"
@@ -20,10 +21,6 @@ on:
         description: "Rows to process for enrich_active"
         required: false
         default: "250"
-  schedule:
-    # Continue NAV vacancy backfill in small, replay-safe increments.
-    - cron: "*/15 * * * *"
-
 concurrency:
   group: nav-job-feed-ingest
   cancel-in-progress: false
@@ -45,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mode="${INPUT_MODE:-backfill}"
+          mode="${INPUT_MODE:-sync}"
           max_pages="${INPUT_MAX_PAGES:-5}"
           batch_size="${INPUT_BATCH_SIZE:-250}"
 
@@ -55,8 +52,8 @@ jobs:
           fi
 
           if [[ "${mode}" == "enrich_active" ]]; then
-            payload="$(jq -nc --arg mode "${mode}" --argjson batchSize "${batch_size}" \
-              '{mode: $mode, batchSize: $batchSize}')"
+            payload="$(jq -nc --arg mode "${mode}" --argjson maxRows "${batch_size}" \
+              '{mode: $mode, maxRows: $maxRows}')"
           else
             payload="$(jq -nc --arg mode "${mode}" --argjson maxPages "${max_pages}" \
               '{mode: $mode, maxPages: $maxPages}')"

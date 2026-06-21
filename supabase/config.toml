@@ -6,3 +6,7 @@ project_id = "rcqnuzplpncnkjmldwqs"
 # Cron/pg_net uses service secret (sb_secret_*) via apikey header — not a user JWT.
 [functions.nav-feed]
 verify_jwt = false
+
+# Compatibility proxy performs its own constant-time service-role check.
+[functions.nav-feed-enrich]
+verify_jwt = false

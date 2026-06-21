@@ -23,6 +23,18 @@ change the opportunity row's `updated_at`, hash, or event version. Unauthorized
 function access returned 401. Cursor, by-ID, health, and cron-health RPC smoke
 tests passed with the field orders documented below.
 
+The Vault service key used by the database invokers was rotated to the active
+runtime key without exposing it. `pg_net` now uses an explicit 150-second
+timeout and exposes service-role-only response status diagnostics without
+response bodies. The scheduled detail retry at 2026-06-21 17:38 UTC completed
+and reduced the pending queue from 1,588 to 1,488, proving the cron-to-Vault-to-
+Edge-Function path rather than only the direct invocation path.
+The scheduled reconciliation at 17:43 UTC advanced the same run from 5,000 to
+7,000 events, and the scheduled steady poll at 17:45 UTC moved the heartbeat
+and reduced source-event lag to 181 seconds. Both cron runs were recorded as
+successful, with zero duplicate external IDs and zero reconciliation detail
+failures.
+
 Six-month reconciliation run `e05f6bb1-0673-42af-b819-2dcd07a15896` started
 successfully. Its first page processed 1,000 events: 628 ACTIVE, 372 INACTIVE,
 672 inserts, 310 updates, 18 stale events ignored, 20 details fetched, and zero

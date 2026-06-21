@@ -9,16 +9,19 @@ header check; `verify_jwt=false` is only used so current `sb_secret_*` keys work
 
 ## Deployment order
 
-1. Pause `nav_feed_sync_every_15min` for the deployment window.
-2. Apply `20260621120000_nav_upstream_repair_foundation.sql`.
-3. Run `sql/014_nav_changed_at_keyset_index.sql` outside a transaction.
-4. Verify the index is valid in `pg_index`.
-5. Apply `20260621120100_nav_source_contracts.sql`.
-6. Apply `20260621120300_nav_repair_invokers.sql`.
+1. Disable the scheduled GitHub Actions ingest workflow.
+2. Apply `20260621115900_pause_nav_writers.sql`.
+3. Apply `20260621120000_nav_upstream_repair_foundation.sql`.
+4. Apply `20260621120050_nav_changed_at_keyset_index.sql`; its Tern directive
+   runs `CREATE INDEX CONCURRENTLY` outside a transaction.
+5. Verify the index is valid in `pg_index`.
+6. Apply `20260621120100_nav_source_contracts.sql`.
 7. Deploy `nav-feed` and `nav-feed-enrich`.
-8. Invoke one steady sync and replay the same page. The replay must produce
+8. Apply `20260621120300_nav_repair_invokers.sql` and
+   `20260621120400_enable_nav_steady_cron.sql`.
+9. Invoke one steady sync and replay the same page. The replay must produce
    `noOpCount > 0` without changing opportunity `updated_at` values.
-9. Re-enable steady cron. Start reconciliation explicitly with
+10. Start reconciliation explicitly with
    `invoke_nav_reconcile(NULL, true)` only after the steady check is green.
 
 No migration performs a metadata backfill over existing opportunities. Event

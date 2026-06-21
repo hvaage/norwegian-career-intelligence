@@ -107,7 +107,8 @@ releases the shared writer lease.
 - `reconcile`: snapshots events from `window_started_at`, a six-month
   `If-Modified-Since` boundary, and resumes by `run_id`. `cutoff_event_ts` is
   the high-watermark captured when the run starts; closeout only changes rows
-  whose event version is not newer than that high-watermark.
+  whose event version is not newer than that high-watermark. Production starts
+  conservatively with two feed pages and 20 detail calls per invocation.
 - `enrich_active`: processes the persistent detail retry queue with backoff.
 - `backfill`: preserves the separate historical cursor and is manual only.
 

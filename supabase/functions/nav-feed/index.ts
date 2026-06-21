@@ -801,6 +801,7 @@ async function runSteadySync(
         ? body.feed_url.trim()
         : fetched.responseUrl;
     const pollingUrl = nextUrl || pageFeedUrl;
+    result.lastFeedUrl = resolveFeedUrl(pollingUrl);
     await updateSyncState(supabase, state.id, {
       feed_url: pollingUrl,
       last_next_url: pollingUrl,

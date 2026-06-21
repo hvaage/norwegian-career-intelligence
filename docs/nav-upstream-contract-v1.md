@@ -7,6 +7,27 @@ must use the service-role RPCs and must never call the NAV feed from a client.
 Both Edge Function write endpoints perform their own constant-time service-role
 header check; `verify_jwt=false` is only used so current `sb_secret_*` keys work.
 
+## Production verification
+
+The contract was deployed to Supabase project `rcqnuzplpncnkjmldwqs` on
+2026-06-21. The scheduled GitHub Actions writer is disabled and database cron
+is authoritative. Production has these active jobs:
+
+- `nav_feed_sync_every_15min`: `*/15 * * * *`
+- `nav_feed_detail_retry_every_30min`: `8,38 * * * *`
+- `nav_feed_reconcile_resume_every_10min`: `3,13,23,33,43,53 * * * *`
+
+The steady cursor stored a concrete NAV feed page and validators. A conditional
+poll returned 304. A forced identical 200 replay produced a no-op and did not
+change the opportunity row's `updated_at`, hash, or event version. Unauthorized
+function access returned 401. Cursor, by-ID, health, and cron-health RPC smoke
+tests passed with the field orders documented below.
+
+Six-month reconciliation run `e05f6bb1-0673-42af-b819-2dcd07a15896` started
+successfully. Its first page processed 1,000 events: 628 ACTIVE, 372 INACTIVE,
+672 inserts, 310 updates, 18 stale events ignored, 20 details fetched, and zero
+detail failures. The run remains resumable while target integration begins.
+
 ## Deployment order
 
 1. Disable the scheduled GitHub Actions ingest workflow.

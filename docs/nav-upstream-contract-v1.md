@@ -35,6 +35,14 @@ and reduced source-event lag to 181 seconds. Both cron runs were recorded as
 successful, with zero duplicate external IDs and zero reconciliation detail
 failures.
 
+On 2026-06-22, exact inventory aggregation was moved out of the interactive
+health request after concurrent reconciliation load caused statement timeouts.
+`nav_source_health_cache_every_5min` refreshes an internally consistent exact
+snapshot in the background. `get_nav_source_health()` preserves all existing
+fields and additionally reports `snapshot_at`, `snapshot_age_seconds`, and
+`snapshot_stale`. Ten consecutive production calls completed in 0.11-0.38
+seconds; the first scheduled cache refresh completed successfully at 05:16 UTC.
+
 Six-month reconciliation run `e05f6bb1-0673-42af-b819-2dcd07a15896` started
 successfully. Its first page processed 1,000 events: 628 ACTIVE, 372 INACTIVE,
 672 inserts, 310 updates, 18 stale events ignored, 20 details fetched, and zero

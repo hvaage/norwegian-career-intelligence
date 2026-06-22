@@ -11,6 +11,7 @@
 - `docs/scoring-and-signal-model.md`
 - `docs/verified-statistical-signal-manual-review-round1.md` (structured manual review of preview samples)
 - `docs/persistent-verified-statistical-signal-model.md` (canonical persistence and governance layer after approval)
+- `docs/persistent-verified-statistical-signal-persistence-workflow.md` (persistence script; optional `manual_review_decisions` CSV to approve specific hashes for `persist_verified_statistical_signals.py`)
 
 **Current preview artifacts (examples for review practice):**
 

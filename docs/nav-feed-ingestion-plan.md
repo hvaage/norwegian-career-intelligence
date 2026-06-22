@@ -11,7 +11,20 @@ Official references:
 - [Product documentation](https://navikt.github.io/pam-stilling-feed/)
 - Production feed host: `https://pam-stilling-feed.nav.no`
 
-## How to run
+## Supabase Edge Function (`nav-feed`)
+
+For browser/API testing without exposing the NAV token:
+
+1. Deploy: `supabase functions deploy nav-feed`
+2. Set secret (optional; without it the function fetches a fresh token from `/api/publicToken`):
+   `supabase secrets set NAV_FEED_TOKEN=<token>`
+3. Open `public/nav-feed-test.html` (local static server), enter **Supabase URL** and **anon key**, click **Test NAV integrasjon**.
+
+The function calls `GET https://pam-stilling-feed.nav.no/api/v1/feed` with `Authorization: Bearer …`. On **401/403** it logs the response body, fetches a new token from `https://pam-stilling-feed.nav.no/api/publicToken`, and retries once.
+
+**Database:** run `sql/005_job_opportunities.sql` before import. The `nav-feed` Edge Function upserts ACTIVE rows into `job_opportunities` (`source` + `external_id` unique).
+
+## How to run (Python smoke test)
 
 1. **Python environment**
 

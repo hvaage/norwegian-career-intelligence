@@ -1,0 +1,1 @@
+-- Mirror: supabase/migrations/20260518180100_nav_sync_cron.sql

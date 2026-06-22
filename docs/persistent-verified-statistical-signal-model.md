@@ -26,6 +26,7 @@
 - `docs/statistical-ingestion-pipeline-mvp.md`
 - `docs/ssb-import-validation-checklist.md`
 - `docs/scoring-and-signal-model.md`
+- `docs/persistent-verified-statistical-signal-persistence-workflow.md` (MVP script, governance gates, optional manual review decisions CSV)
 
 **Design posture:** governance-first, explainability-first, deterministic-first, conservative promotion to persistence.
 

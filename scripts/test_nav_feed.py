@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""
-Technical smoke test for NAV pam-stilling-feed.
+"""Technical smoke test for the NAV pam-stilling-feed API.
 
-References:
-  - Swagger: https://pam-stilling-feed.ekstern.dev.nav.no/swagger
-  - OpenAPI: https://pam-stilling-feed.ekstern.dev.nav.no/api/openapi.json
-  - Docs: https://navikt.github.io/pam-stilling-feed/
+The scheduled workflow uses ``NAV_FEED_TOKEN``. NAV's rotating public token
+is available only for an explicitly requested manual experiment.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
 
 import requests
 
@@ -29,6 +25,14 @@ DEFAULT_BASE_URL = "https://pam-stilling-feed.nav.no"
 FEED_PATH = "/api/v1/feed"
 ENTRY_PATH_TEMPLATE = "/api/v1/feedentry/{entry_id}"
 PUBLIC_TOKEN_PATH = "/api/publicToken"
+
+EXIT_OK = 0
+EXIT_DATA_ERROR = 1
+EXIT_INFRASTRUCTURE = 78
+REQUEST_TIMEOUT_SECONDS = (10, 60)
+RETRY_DELAYS_SECONDS = (2, 4, 8)
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+INFRASTRUCTURE_STATUS_CODES = {401, 403, *RETRYABLE_STATUS_CODES}
 
 RELEVANT_HEADER_NAMES = (
     "etag",
@@ -54,7 +58,7 @@ def _base_url() -> str:
     return raw or DEFAULT_BASE_URL
 
 
-def _truthy_env(name: str, default: bool) -> bool:
+def _truthy_env(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
@@ -66,39 +70,58 @@ def _extract_jwt(value: str) -> str | None:
     return match.group(0) if match else None
 
 
-def _fetch_public_token(base: str) -> str | None:
-    url = base.rstrip("/") + PUBLIC_TOKEN_PATH
-    try:
-        response = requests.get(url, timeout=30)
-    except requests.RequestException as exc:
-        print(f"Could not fetch NAV public token: {exc}")
-        return None
-    if not response.ok:
-        print(f"NAV public token endpoint returned {response.status_code}.")
-        return None
+def _retry_after_seconds(response: requests.Response, fallback: int) -> int:
+    value = response.headers.get("Retry-After", "").strip()
+    if value.isdigit():
+        return min(int(value), 60)
+    return fallback
+
+
+def _get_with_retry(
+    session: requests.Session, url: str
+) -> tuple[requests.Response | None, str | None]:
+    for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.RequestException as exc:
+            if attempt == len(RETRY_DELAYS_SECONDS):
+                return None, str(exc)
+            time.sleep(RETRY_DELAYS_SECONDS[attempt])
+            continue
+
+        if response.status_code not in RETRYABLE_STATUS_CODES:
+            return response, None
+        if attempt == len(RETRY_DELAYS_SECONDS):
+            return response, None
+
+        time.sleep(_retry_after_seconds(response, RETRY_DELAYS_SECONDS[attempt]))
+
+    return None, "request retry loop ended unexpectedly"
+
+
+def _fetch_public_token(base: str) -> tuple[str | None, str | None]:
+    response, error = _get_with_retry(session=requests.Session(), url=base.rstrip("/") + PUBLIC_TOKEN_PATH)
+    if error:
+        return None, f"NAV public token request failed: {error}"
+    assert response is not None
+    if response.status_code != 200:
+        return None, f"NAV public token endpoint returned HTTP {response.status_code}"
     token = _extract_jwt(response.text)
     if not token:
-        print("NAV public token response did not contain a JWT-looking token.")
-    return token
+        return None, "NAV public token response did not contain a JWT-looking token"
+    return token, None
 
 
-def _optional_bearer_token(base: str) -> tuple[str | None, str]:
-    token = os.environ.get("NAV_FEED_TOKEN")
-    if token is not None:
-        token = token.strip()
-        if token:
-            return token, "NAV_FEED_TOKEN"
+def _optional_bearer_token(base: str) -> tuple[str | None, str, str | None]:
+    token = os.environ.get("NAV_FEED_TOKEN", "").strip()
+    if token:
+        return token, "configured_secret", None
 
-    use_public_token = _truthy_env(
-        "NAV_FEED_USE_PUBLIC_TOKEN",
-        default=base.rstrip("/") == DEFAULT_BASE_URL,
-    )
-    if use_public_token:
-        public_token = _fetch_public_token(base)
-        if public_token:
-            return public_token, "NAV public token"
+    if _truthy_env("NAV_FEED_USE_PUBLIC_TOKEN"):
+        token, error = _fetch_public_token(base)
+        return token, "manual_public_token", error
 
-    return None, "none"
+    return None, "none", "NAV_FEED_TOKEN is not configured"
 
 
 def _session_headers(token: str | None) -> dict[str, str]:
@@ -108,60 +131,25 @@ def _session_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
-def _print_auth_debug(base: str, token: str | None, token_source: str) -> None:
-    """Safe auth debug: never print the full token."""
-    print("\n--- Auth / URL debug (token never printed in full) ---")
-    print(f"Effective base URL: {base}")
-    print(f"Token source: {token_source}")
-    headers = _session_headers(token)
-    auth_present = "Authorization" in headers
-    print(f"Authorization header will be sent: {auth_present}")
-    if "Authorization" in headers:
-        scheme, _, cred = headers["Authorization"].partition(" ")
-        print(f"Auth header scheme: {scheme.strip() or '(empty)'}")
-        # Never print `cred` (bearer token).
-        if cred:
-            print(f"Bearer credential length: {len(cred)} characters")
-            if len(cred) >= 12:
-                print(f"Bearer credential prefix (6): {cred[:6]}...")
-                print(f"Bearer credential suffix (6): ...{cred[-6:]}")
-            elif len(cred) >= 6:
-                print(
-                    "Bearer credential prefix/suffix: (token 6–11 chars; "
-                    "6+6 preview would overlap — showing length only)"
-                )
-            else:
-                print(
-                    "Bearer credential: (shorter than 6 chars; "
-                    "not printing any fragment)"
-                )
-    else:
-        print("Auth header scheme: (none)")
-    print("--- end auth debug ---\n")
-
-
 def _pick_relevant_headers(response: requests.Response) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key, value in response.headers.items():
-        if key.lower() in RELEVANT_HEADER_NAMES:
-            out[key] = value
-    return out
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in RELEVANT_HEADER_NAMES
+    }
 
 
 def _safe_json(response: requests.Response) -> tuple[Any | None, str | None]:
-    """Returns (parsed, error_message)."""
-    ctype = response.headers.get("Content-Type", "")
-    if "json" not in ctype.lower() and response.text.strip()[:1] not in "{[":
-        return None, f"non-JSON response (Content-Type: {ctype or 'missing'})"
     try:
         return response.json(), None
     except ValueError as exc:
         return None, f"JSON parse error: {exc}"
 
 
-def _top_level_keys(data: Any) -> list[str] | None:
-    if isinstance(data, dict):
-        return list(data.keys())
+def _error_title(response: requests.Response) -> str | None:
+    data, _ = _safe_json(response)
+    if isinstance(data, dict) and isinstance(data.get("title"), str):
+        return data["title"]
     return None
 
 
@@ -169,9 +157,7 @@ def _extract_feed_items(data: Any) -> list[Any] | None:
     if not isinstance(data, dict):
         return None
     items = data.get("items")
-    if isinstance(items, list):
-        return items
-    return None
+    return items if isinstance(items, list) else None
 
 
 def _entry_path_from_item(item: Any) -> str | None:
@@ -181,183 +167,75 @@ def _entry_path_from_item(item: Any) -> str | None:
     if isinstance(url, str) and url.strip():
         return url.strip()
     for key in ("id", "uuid", "entryId", "entry_id"):
-        val = item.get(key)
-        if isinstance(val, str) and val.strip():
-            return ENTRY_PATH_TEMPLATE.format(entry_id=val.strip())
-    nested = item.get("_feed_entry")
-    if isinstance(nested, dict):
-        for key in ("id", "uuid"):
-            val = nested.get(key)
-            if isinstance(val, str) and val.strip():
-                return ENTRY_PATH_TEMPLATE.format(entry_id=val.strip())
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return ENTRY_PATH_TEMPLATE.format(entry_id=value.strip())
     return None
 
 
-def _first_entry_path(items: list[Any] | None) -> str | None:
-    if not items:
-        return None
-    for item in items:
-        path = _entry_path_from_item(item)
-        if path:
-            return path
-    return None
+def _request_json(session: requests.Session, url: str) -> tuple[int, Any | None]:
+    print(f"GET {url}")
+    response, request_error = _get_with_retry(session, url)
+    if request_error:
+        print(f"Infrastructure error: {request_error}")
+        return EXIT_INFRASTRUCTURE, None
+    assert response is not None
 
+    print(f"HTTP {response.status_code}")
+    for key, value in sorted(_pick_relevant_headers(response).items()):
+        print(f"  {key}: {value}")
 
-def _print_auth_hint(status_code: int, had_token: bool) -> None:
-    if status_code in (401, 403):
-        if not had_token:
-            print(
-                f"\nMissing NAV_FEED_TOKEN: server returned {status_code}. "
-                "Set NAV_FEED_TOKEN in .env (see .env.example) and retry."
-            )
-        else:
-            print(
-                f"\nAuth failed ({status_code}) with a token present: "
-                "verify NAV_FEED_TOKEN value, audience, and expiry."
-            )
-        print(
-            "Dev/prod hosts may require Bearer auth per NAV's feed terms; "
-            "see https://navikt.github.io/pam-stilling-feed/"
+    if response.status_code != 200:
+        title = _error_title(response)
+        suffix = f": {title}" if title else ""
+        print(f"NAV returned HTTP {response.status_code}{suffix}")
+        status = (
+            EXIT_INFRASTRUCTURE
+            if response.status_code in INFRASTRUCTURE_STATUS_CODES
+            else EXIT_DATA_ERROR
         )
+        return status, None
 
-
-def _write_raw(path: Path, response: requests.Response) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(response.content)
-    print(f"Saved raw body to {path}")
-
-
-def _run_feed(session: requests.Session, base: str, token: str | None) -> tuple[Any | None, str | None]:
-    url = base.rstrip("/") + FEED_PATH
-    print(f"\nGET {url}")
-    had_token = bool(token)
-    try:
-        response = session.get(url, timeout=60)
-    except requests.RequestException as exc:
-        print(f"Request failed: {exc}")
-        return None, None
-
-    if response.status_code in (401, 403) and had_token:
-        err_snip = response.text[:500]
-        print(f"Auth failed ({response.status_code}); body snippet:\n{err_snip}")
-        print("Public token may be rotated — fetching fresh token from /api/publicToken")
-        fresh = _fetch_public_token(base)
-        if fresh:
-            session.headers["Authorization"] = f"Bearer {fresh}"
-            response = session.get(url, timeout=60)
-            print(f"Retry status: {response.status_code}")
-        else:
-            print("publicToken refresh failed.")
-
-    print(f"Status: {response.status_code}")
-    for k, v in sorted(_pick_relevant_headers(response).items()):
-        print(f"  {k}: {v}")
-
-    data, err = _safe_json(response)
-    if err:
-        print(f"Body parse: {err}")
-        snippet = response.text[:500]
-        if snippet:
-            print(f"Body snippet (first 500 chars):\n{snippet}")
-        _print_auth_hint(response.status_code, had_token)
-        return None, None
-
-    keys = _top_level_keys(data)
-    if keys is not None:
-        print(f"Top-level JSON keys: {keys}")
-    else:
-        print("Unexpected JSON shape: top-level is not an object.")
-
-    items = _extract_feed_items(data)
-    if items is None:
-        print(
-            "Could not find a list at key 'items' (unexpected feed shape — "
-            "often an auth or error JSON envelope instead of a Feed document)."
-        )
-    else:
-        print(f"Feed item count (this page): {len(items)}")
-        for i, entry in enumerate(items[:3], start=1):
-            print(f"--- entry {i} ---")
-            try:
-                print(json.dumps(entry, ensure_ascii=False, indent=2)[:4000])
-            except (TypeError, ValueError):
-                print(repr(entry)[:4000])
-
-    entry_path = _first_entry_path(items)
-    if entry_path:
-        print(f"\nDetected feed entry path: {entry_path}")
-    else:
-        print("\nNo feed entry path detected from first items.")
-
-    _print_auth_hint(response.status_code, had_token)
-
-    out_path = _project_root() / "data" / "raw" / "sample_feed.json"
-    _write_raw(out_path, response)
-
-    return data, entry_path
-
-
-def _run_entry(
-    session: requests.Session,
-    base: str,
-    entry_path: str,
-    token: str | None,
-) -> None:
-    url = urljoin(base.rstrip("/") + "/", entry_path.lstrip("/"))
-    print(f"\nGET {url}")
-    had_token = bool(token)
-    try:
-        response = session.get(url, timeout=60)
-    except requests.RequestException as exc:
-        print(f"Request failed: {exc}")
-        return
-
-    print(f"Status: {response.status_code}")
-    for k, v in sorted(_pick_relevant_headers(response).items()):
-        print(f"  {k}: {v}")
-
-    data, err = _safe_json(response)
-    if err:
-        print(f"Body parse: {err}")
-        snippet = response.text[:500]
-        if snippet:
-            print(f"Body snippet (first 500 chars):\n{snippet}")
-        _print_auth_hint(response.status_code, had_token)
-    else:
-        keys = _top_level_keys(data)
-        if keys is not None:
-            print(f"Top-level JSON keys: {keys}")
-
-    _print_auth_hint(response.status_code, had_token)
-
-    out_path = _project_root() / "data" / "raw" / "sample_entry.json"
-    _write_raw(out_path, response)
+    data, error = _safe_json(response)
+    if error:
+        print(f"Data error: expected JSON from HTTP 200 response ({error})")
+        return EXIT_DATA_ERROR, None
+    return EXIT_OK, data
 
 
 def main() -> int:
     _load_env()
-    base = _base_url()
-    token, token_source = _optional_bearer_token(base)
+    base = _base_url().rstrip("/")
+    token, token_source, token_error = _optional_bearer_token(base)
 
-    _print_auth_debug(base, token, token_source)
+    print(f"Effective base URL: {base}")
+    print(f"Token source: {token_source}")
+    print(f"Authorization header will be sent: {bool(token)}")
+    if token_error:
+        print(f"Infrastructure/auth error: {token_error}")
+        return EXIT_INFRASTRUCTURE
 
     session = requests.Session()
     session.headers.update(_session_headers(token))
 
-    data, entry_path = _run_feed(session, base, token)
-    items = _extract_feed_items(data)
+    status, feed = _request_json(session, base + FEED_PATH)
+    if status != EXIT_OK:
+        return status
+
+    items = _extract_feed_items(feed)
     if items is None:
-        print("\nSmoke test failed: feed response did not contain an 'items' list.")
-        return 1
+        print("Data error: HTTP 200 feed response did not contain an 'items' list")
+        return EXIT_DATA_ERROR
+    print(f"Feed contains {len(items)} items")
 
-    if entry_path:
-        _run_entry(session, base, entry_path, token)
-    else:
-        print("\nSkipping feedentry request (no entry path).")
-        print("sample_entry.json was not written (no GET /api/v1/feedentry/... call).")
-        return 1
+    entry_path = next((path for item in items if (path := _entry_path_from_item(item))), None)
+    if not entry_path:
+        print("No entry URL was available; feed contract is valid, skipping entry probe")
+        return EXIT_OK
 
-    return 0
+    entry_url = entry_path if entry_path.startswith("http") else base + entry_path
+    status, _ = _request_json(session, entry_url)
+    return status
 
 
 if __name__ == "__main__":

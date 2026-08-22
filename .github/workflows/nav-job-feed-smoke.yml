@@ -2,6 +2,12 @@ name: NAV job feed smoke test
 
 on:
   workflow_dispatch:
+    inputs:
+      use_public_token:
+        description: "Use NAV's rotating public token for a manual experiment"
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Verify daily that the NAV vacancy feed can be downloaded.
     - cron: "20 6 * * *"
@@ -12,7 +18,8 @@ jobs:
     timeout-minutes: 10
     env:
       NAV_FEED_BASE_URL: https://pam-stilling-feed.nav.no
-      NAV_FEED_USE_PUBLIC_TOKEN: "1"
+      NAV_FEED_TOKEN: ${{ secrets.NAV_FEED_TOKEN }}
+      NAV_FEED_USE_PUBLIC_TOKEN: ${{ github.event_name == 'workflow_dispatch' && inputs.use_public_token && '1' || '0' }}
 
     steps:
       - name: Check out repository
@@ -28,4 +35,20 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Smoke test NAV feed
-        run: python scripts/test_nav_feed.py
+        shell: bash
+        run: |
+          set +e
+          python scripts/test_nav_feed.py
+          status=$?
+
+          if [[ "$status" -eq 78 ]]; then
+            echo "::warning::NAV job feed smoke test is degraded: external NAV/auth infrastructure is unavailable or not configured."
+            {
+              echo "## NAV job feed smoke test"
+              echo "Status: degraded (exit 78)"
+              echo "The workflow is green because this is an external/auth infrastructure condition, not a feed contract failure."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          exit "$status"

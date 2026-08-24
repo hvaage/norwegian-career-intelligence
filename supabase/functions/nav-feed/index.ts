@@ -958,9 +958,21 @@ async function runReconcileCloseout(
   run: ReconcileRun,
   result: RunResult,
 ): Promise<RunResult> {
+  const { error: backfillError } = await supabase.rpc(
+    "nav_backfill_reconcile_source_versions",
+    { p_run_id: run.run_id, p_limit: 100 },
+  );
+  if (backfillError) {
+    throw new Error(
+      `NAV reconcile source-version backfill failed: ${backfillError.message}`,
+    );
+  }
   const { data, error } = await supabase.rpc("closeout_nav_reconciliation", {
     p_run_id: run.run_id,
-    p_limit: 500,
+    // Closeout is deliberately incremental. The database function is
+    // set-based, while this cap keeps large raw payload batches beneath the
+    // database statement timeout.
+    p_limit: 100,
   });
   if (error) throw new Error(`NAV reconcile closeout failed: ${error.message}`);
   const row = Array.isArray(data) ? data[0] : data;
